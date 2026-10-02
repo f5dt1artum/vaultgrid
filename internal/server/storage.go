@@ -57,10 +57,21 @@ type pool struct {
 	devices      []deviceInput
 	rawCapacity  int64
 	reservations map[string]reservation
+	volumeBytes  int64 // total sizeBytes of volumes in this pool
+}
+
+// volume is a capacity allocation inside a pool with an optional exclusive
+// node binding. generation is bumped on every binding state change.
+type volume struct {
+	id         string
+	poolID     string
+	sizeBytes  int64
+	generation int64
+	binding    string // "" when unbound
 }
 
 func (p *pool) allocated() int64 {
-	var total int64
+	var total int64 = p.volumeBytes
 	for _, r := range p.reservations {
 		total += r.bytes
 	}
@@ -86,12 +97,14 @@ func (p *pool) view() poolView {
 type store struct {
 	mu          sync.RWMutex
 	pools       map[string]*pool
+	volumes     map[string]*volume
 	deviceOwner map[string]string
 }
 
 func newStore() *store {
 	return &store{
 		pools:       make(map[string]*pool),
+		volumes:     make(map[string]*volume),
 		deviceOwner: make(map[string]string),
 	}
 }
@@ -200,7 +213,7 @@ func (s *store) deletePool(w http.ResponseWriter, id string) {
 		writeError(w, http.StatusNotFound, "pool_not_found")
 		return
 	}
-	if len(p.reservations) > 0 {
+	if len(p.reservations) > 0 || p.volumeBytes > 0 {
 		writeError(w, http.StatusConflict, "pool_not_empty")
 		return
 	}

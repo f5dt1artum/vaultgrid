@@ -1,8 +1,9 @@
 // Package server exposes the frozen public surface of VaultGrid.
 //
-// In addition to process health, it serves the storage-pool and capacity
-// reservation HTTP API described in README.md. The exported surface
-// (Handler, Version, VAULTGRID_ADDR handling) stays backward compatible.
+// In addition to process health, it serves the storage-pool, capacity
+// reservation and volume lifecycle HTTP API described in README.md. The
+// exported surface (Handler, Version, VAULTGRID_ADDR handling) stays
+// backward compatible.
 package server
 
 import (
@@ -42,17 +43,27 @@ func Handler() http.Handler {
 	return mux
 }
 
-const storagePoolPath = "/v1/storage-pools"
+const (
+	storagePoolPath = "/v1/storage-pools"
+	volumePath      = "/v1/volumes"
+)
 
 // route dispatches every non-healthz request. Paths it does not recognise
 // answer 404/not_found; recognised paths with the wrong verb answer 405.
 func (s *store) route(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != storagePoolPath && !strings.HasPrefix(r.URL.Path, storagePoolPath+"/") {
+	switch {
+	case r.URL.Path == volumePath || strings.HasPrefix(r.URL.Path, volumePath+"/"):
+		s.routeVolumes(w, r)
+	case r.URL.Path == storagePoolPath || strings.HasPrefix(r.URL.Path, storagePoolPath+"/"):
+		s.routeStoragePools(w, r)
+	default:
 		writeError(w, http.StatusNotFound, "not_found")
-		return
 	}
+}
 
-	parts := splitPoolPath(r.URL.Path)
+// routeStoragePools dispatches /v1/storage-pools and its sub-paths.
+func (s *store) routeStoragePools(w http.ResponseWriter, r *http.Request) {
+	parts := splitPath(r.URL.Path, storagePoolPath)
 	for _, seg := range parts {
 		if seg == "" {
 			writeError(w, http.StatusNotFound, "not_found")
@@ -95,9 +106,9 @@ func (s *store) route(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// splitPoolPath splits the tail after /v1/storage-pools into path segments.
-func splitPoolPath(path string) []string {
-	rest := strings.TrimPrefix(path, storagePoolPath)
+// splitPath splits the tail after prefix into path segments.
+func splitPath(path, prefix string) []string {
+	rest := strings.TrimPrefix(path, prefix)
 	if rest == "" {
 		return nil
 	}

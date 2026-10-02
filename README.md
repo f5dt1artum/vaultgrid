@@ -2,7 +2,7 @@
 
 这是一个面向存储与数据管理的块/对象存储与卷管理控制面。长期目标是提供存储池与卷生命周期、S3 风格对象接口、纠删码与多副本放置、一致性哈希与再平衡、快照与克隆、完整性自愈和配额，把存储控制面沉淀为可复用服务。
 
-仓库采用 Go。当前提供进程健康检查、存储池目录与池级容量预留；每个能力都定义可观察的公共行为、兼容边界和失败语义，不依赖未公开内部 API。所有状态保存在内存中，进程重启后清空。
+仓库采用 Go。当前提供进程健康检查、存储池目录、池级容量预留以及卷生命周期与单节点独占绑定；每个能力都定义可观察的公共行为、兼容边界和失败语义，不依赖未公开内部 API。所有状态保存在内存中，进程重启后清空。
 
 ## 启动
 
@@ -76,6 +76,66 @@ go run ./cmd/vaultgrid
 
 `DELETE /v1/storage-pools/{id}/reservations/{requestId}` 返回 `204` 并立即释放容量；重复删除（含从未存在的预留）仍返回 `204`。
 
+## 卷
+
+卷是池内的容量占用，卷 id、池 id、节点 id 均遵循前述 id 规则。卷的 `sizeBytes` 直接计入所属池的 `allocatedBytes`（与显式预留共享同一容量预算）。
+
+### 创建卷（幂等）
+
+`POST /v1/volumes`
+
+```json
+{"id": "vol-1", "poolId": "pool-a", "sizeBytes": 600}
+```
+
+`sizeBytes` 为正 JSON 整数。成功返回 `201`：
+
+```json
+{"id": "vol-1", "poolId": "pool-a", "sizeBytes": 600, "generation": 0, "binding": null}
+```
+
+- 相同 `id`、`poolId`、`sizeBytes` 重试返回 `200` 及当前卷结果，不重复计量。
+- 相同 `id` 但参数不同返回 `409 volume_exists`。
+- 池不存在返回 `404 pool_not_found`。
+- 容量不足返回 `409 insufficient_capacity`；并发创建绝不会使池超配，失败不遗留卷或占用。
+
+### 列出与查询
+
+- `GET /v1/volumes` 返回 `{"items":[...]}`，按卷 id 升序。
+- `GET /v1/volumes/{id}` 返回单个卷；不存在返回 `404 volume_not_found`。
+
+### 绑定与解绑
+
+`PUT /v1/volumes/{id}/binding`
+
+```json
+{"nodeId": "node-1", "expectedGeneration": 0}
+```
+
+`expectedGeneration` 为非负 JSON 整数且必须等于卷当前的 `generation`：
+
+- 未绑定卷：返回 `200`，`binding` 记录 `nodeId`，`generation` 加一。
+- 已绑定到同一节点且版本匹配：返回 `200` 当前结果，`generation` 不变。
+- 试图改绑其他节点：`409 volume_already_bound`。
+- 版本不符：`409 stale_generation`；同版本并发请求只有一个能改变状态。
+
+`DELETE /v1/volumes/{id}/binding?expectedGeneration=<n>`：
+
+- 版本错误返回 `409 stale_generation`。
+- 已绑定时返回 `204` 并把 `generation` 加一。
+- 原本未绑定时返回 `204`，`generation` 不变。
+- 缺少、重复、非整数或额外查询参数返回 `400 invalid_request`。
+
+### 删除卷
+
+`DELETE /v1/volumes/{id}`：
+
+- 未绑定卷返回 `204` 并归还容量。
+- 绑定中的卷返回 `409 volume_in_use`。
+- 不存在返回 `404 volume_not_found`。
+
+卷存在时删除所属池仍返回 `409 pool_not_empty`。
+
 ## 错误与路由
 
 错误响应统一为：
@@ -86,15 +146,20 @@ go run ./cmd/vaultgrid
 
 | HTTP | code | 场景 |
 | --- | --- | --- |
-| 400 | `invalid_request` | 未知字段、空设备集、非法 id、容量非正整数或非整数等，且不产生部分状态 |
+| 400 | `invalid_request` | 未知字段、空设备集、非法 id、容量或版本非正/非整数、非法查询参数等，且不产生部分状态 |
 | 404 | `pool_not_found` | 查询、预留或删除不存在的池 |
+| 404 | `volume_not_found` | 查询、绑定、解绑或删除不存在的卷 |
 | 404 | `not_found` | 未知路径 |
 | 405 | `method_not_allowed` | 不支持的方法，响应带正确的 `Allow` 头 |
 | 409 | `pool_exists` | 池 id 已存在 |
 | 409 | `device_in_use` | 设备已被其他池占用 |
-| 409 | `pool_not_empty` | 删除仍有预留的池 |
+| 409 | `pool_not_empty` | 删除仍有预留或卷的池 |
 | 409 | `idempotency_conflict` | 同 requestId 重试但 bytes 不同 |
-| 409 | `insufficient_capacity` | 预留超过池可用容量 |
+| 409 | `insufficient_capacity` | 预留或建卷超过池可用容量 |
+| 409 | `volume_exists` | 同卷 id 重试但参数不同 |
+| 409 | `volume_already_bound` | 已绑定卷试图改绑其他节点 |
+| 409 | `volume_in_use` | 删除仍绑定在节点上的卷 |
+| 409 | `stale_generation` | 绑定/解绑时 expectedGeneration 与当前版本不符 |
 
 ## 验证
 
