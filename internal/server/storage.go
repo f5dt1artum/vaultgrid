@@ -67,12 +67,12 @@ func (p *pool) allocated() int64 {
 	return total
 }
 
-func (p *pool) view() poolView {
+func (p *pool) view(volumeBytes int64) poolView {
 	devices := make([]deviceView, len(p.devices))
 	for i, d := range p.devices {
 		devices[i] = deviceView{ID: d.ID, CapacityBytes: d.CapacityBytes, FaultDomain: d.FaultDomain}
 	}
-	allocated := p.allocated()
+	allocated := p.allocated() + volumeBytes
 	return poolView{
 		ID:               p.id,
 		Devices:          devices,
@@ -87,12 +87,14 @@ type store struct {
 	mu          sync.RWMutex
 	pools       map[string]*pool
 	deviceOwner map[string]string
+	volumes     map[string]*volume
 }
 
 func newStore() *store {
 	return &store{
 		pools:       make(map[string]*pool),
 		deviceOwner: make(map[string]string),
+		volumes:     make(map[string]*volume),
 	}
 }
 
@@ -109,7 +111,7 @@ func (s *store) listPools(w http.ResponseWriter) {
 	sort.Strings(ids)
 	items := make([]poolView, 0, len(ids))
 	for _, id := range ids {
-		items = append(items, s.pools[id].view())
+		items = append(items, s.pools[id].view(s.volumeBytes(id)))
 	}
 	s.mu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
@@ -124,7 +126,7 @@ func (s *store) getPool(w http.ResponseWriter, id string) {
 	p, ok := s.pools[id]
 	var v poolView
 	if ok {
-		v = p.view()
+		v = p.view(s.volumeBytes(id))
 	}
 	s.mu.RUnlock()
 	if !ok {
@@ -185,7 +187,7 @@ func (s *store) createPool(w http.ResponseWriter, r *http.Request) {
 	for _, d := range devices {
 		s.deviceOwner[d.ID] = in.ID
 	}
-	writeJSON(w, http.StatusCreated, p.view())
+	writeJSON(w, http.StatusCreated, p.view(0))
 }
 
 func (s *store) deletePool(w http.ResponseWriter, id string) {
@@ -200,7 +202,7 @@ func (s *store) deletePool(w http.ResponseWriter, id string) {
 		writeError(w, http.StatusNotFound, "pool_not_found")
 		return
 	}
-	if len(p.reservations) > 0 {
+	if len(p.reservations) > 0 || s.volumeBytes(id) > 0 {
 		writeError(w, http.StatusConflict, "pool_not_empty")
 		return
 	}
@@ -237,7 +239,7 @@ func (s *store) createReservation(w http.ResponseWriter, r *http.Request, poolID
 		writeJSON(w, http.StatusOK, reservationView{PoolID: poolID, RequestID: existing.requestID, Bytes: existing.bytes})
 		return
 	}
-	allocated := p.allocated()
+	allocated := p.allocated() + s.volumeBytes(poolID)
 	if allocated > p.rawCapacity-in.Bytes {
 		writeError(w, http.StatusConflict, "insufficient_capacity")
 		return

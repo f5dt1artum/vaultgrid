@@ -42,17 +42,26 @@ func Handler() http.Handler {
 	return mux
 }
 
-const storagePoolPath = "/v1/storage-pools"
+const (
+	storagePoolPath = "/v1/storage-pools"
+	volumesPath     = "/v1/volumes"
+)
 
 // route dispatches every non-healthz request. Paths it does not recognise
 // answer 404/not_found; recognised paths with the wrong verb answer 405.
 func (s *store) route(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != storagePoolPath && !strings.HasPrefix(r.URL.Path, storagePoolPath+"/") {
+	switch {
+	case r.URL.Path == storagePoolPath || strings.HasPrefix(r.URL.Path, storagePoolPath+"/"):
+		s.routePools(w, r)
+	case r.URL.Path == volumesPath || strings.HasPrefix(r.URL.Path, volumesPath+"/"):
+		s.routeVolumes(w, r)
+	default:
 		writeError(w, http.StatusNotFound, "not_found")
-		return
 	}
+}
 
-	parts := splitPoolPath(r.URL.Path)
+func (s *store) routePools(w http.ResponseWriter, r *http.Request) {
+	parts := splitPath(r.URL.Path, storagePoolPath)
 	for _, seg := range parts {
 		if seg == "" {
 			writeError(w, http.StatusNotFound, "not_found")
@@ -95,9 +104,50 @@ func (s *store) route(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// splitPoolPath splits the tail after /v1/storage-pools into path segments.
-func splitPoolPath(path string) []string {
-	rest := strings.TrimPrefix(path, storagePoolPath)
+func (s *store) routeVolumes(w http.ResponseWriter, r *http.Request) {
+	parts := splitPath(r.URL.Path, volumesPath)
+	for _, seg := range parts {
+		if seg == "" {
+			writeError(w, http.StatusNotFound, "not_found")
+			return
+		}
+	}
+	switch {
+	case len(parts) == 0:
+		switch r.Method {
+		case http.MethodGet:
+			s.listVolumes(w)
+		case http.MethodPost:
+			s.createVolume(w, r)
+		default:
+			methodNotAllowed(w, http.MethodGet, http.MethodPost)
+		}
+	case len(parts) == 1:
+		switch r.Method {
+		case http.MethodGet:
+			s.getVolume(w, parts[0])
+		case http.MethodDelete:
+			s.deleteVolume(w, parts[0])
+		default:
+			methodNotAllowed(w, http.MethodGet, http.MethodDelete)
+		}
+	case len(parts) == 2 && parts[1] == "binding":
+		switch r.Method {
+		case http.MethodPut:
+			s.putBinding(w, r, parts[0])
+		case http.MethodDelete:
+			s.deleteBinding(w, r, parts[0])
+		default:
+			methodNotAllowed(w, http.MethodPut, http.MethodDelete)
+		}
+	default:
+		writeError(w, http.StatusNotFound, "not_found")
+	}
+}
+
+// splitPath splits the tail after prefix into path segments.
+func splitPath(path, prefix string) []string {
+	rest := strings.TrimPrefix(path, prefix)
 	if rest == "" {
 		return nil
 	}
