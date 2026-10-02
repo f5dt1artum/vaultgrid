@@ -20,6 +20,7 @@ type health struct {
 
 // Handler returns the HTTP surface served by the baseline.
 func Handler() http.Handler {
+	s := newStore()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -30,5 +31,6 @@ func Handler() http.Handler {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(health{Status: "ok", Service: "vaultgrid", Version: Version})
 	})
+	mux.HandleFunc("/", s.route)
 	return mux
 }
