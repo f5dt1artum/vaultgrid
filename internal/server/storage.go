@@ -53,25 +53,27 @@ type reservation struct {
 }
 
 type pool struct {
-	id           string
-	devices      []deviceInput
-	rawCapacity  int64
-	reservations map[string]reservation
-	volumeBytes  int64 // total sizeBytes of volumes in this pool
+	id            string
+	devices       []deviceInput
+	rawCapacity   int64
+	reservations  map[string]reservation
+	volumeBytes   int64 // total sizeBytes of volumes in this pool
+	snapshotBytes int64 // total sizeBytes of snapshots sourced from this pool
 }
 
 // volume is a capacity allocation inside a pool with an optional exclusive
 // node binding. generation is bumped on every binding state change.
 type volume struct {
-	id         string
-	poolID     string
-	sizeBytes  int64
-	generation int64
-	binding    string // "" when unbound
+	id               string
+	poolID           string
+	sizeBytes        int64
+	generation       int64
+	binding          string // "" when unbound
+	sourceSnapshotID string // snapshot this volume was cloned from; "" otherwise
 }
 
 func (p *pool) allocated() int64 {
-	var total int64 = p.volumeBytes
+	var total int64 = p.volumeBytes + p.snapshotBytes
 	for _, r := range p.reservations {
 		total += r.bytes
 	}
@@ -98,6 +100,7 @@ type store struct {
 	mu          sync.RWMutex
 	pools       map[string]*pool
 	volumes     map[string]*volume
+	snapshots   map[string]*snapshot
 	deviceOwner map[string]string
 }
 
@@ -105,6 +108,7 @@ func newStore() *store {
 	return &store{
 		pools:       make(map[string]*pool),
 		volumes:     make(map[string]*volume),
+		snapshots:   make(map[string]*snapshot),
 		deviceOwner: make(map[string]string),
 	}
 }
@@ -213,7 +217,7 @@ func (s *store) deletePool(w http.ResponseWriter, id string) {
 		writeError(w, http.StatusNotFound, "pool_not_found")
 		return
 	}
-	if len(p.reservations) > 0 || p.volumeBytes > 0 {
+	if len(p.reservations) > 0 || p.volumeBytes > 0 || p.snapshotBytes > 0 {
 		writeError(w, http.StatusConflict, "pool_not_empty")
 		return
 	}
