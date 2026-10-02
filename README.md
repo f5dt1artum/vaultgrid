@@ -2,7 +2,7 @@
 
 这是一个面向存储与数据管理的块/对象存储与卷管理控制面。长期目标是提供存储池与卷生命周期、S3 风格对象接口、纠删码与多副本放置、一致性哈希与再平衡、快照与克隆、完整性自愈和配额，把存储控制面沉淀为可复用服务。
 
-仓库采用 Go。当前提供进程健康检查、存储池目录、池级容量预留以及卷生命周期与单节点独占绑定；每个能力都定义可观察的公共行为、兼容边界和失败语义，不依赖未公开内部 API。所有状态保存在内存中，进程重启后清空。
+仓库采用 Go。当前提供进程健康检查、存储池目录、池级容量预留、卷生命周期与单节点独占绑定，以及内存态卷快照与基于快照的跨池克隆；每个能力都定义可观察的公共行为、兼容边界和失败语义，不依赖未公开内部 API。所有状态保存在内存中，进程重启后清空。
 
 ## 启动
 
@@ -136,6 +136,57 @@ go run ./cmd/vaultgrid
 
 卷存在时删除所属池仍返回 `409 pool_not_empty`。
 
+## 快照
+
+快照是卷在某一代的内存态副本：创建后即与源卷解耦，源卷后续变化或删除都不影响快照。快照按 `sizeBytes` 计入**源池**的 `allocatedBytes`（与卷、预留共享同一容量预算），直到快照被删除。快照 id、卷 id 均遵循前述 id 规则。
+
+### 创建快照（幂等）
+
+`POST /v1/volumes/{volumeId}/snapshots`
+
+```json
+{"id": "snap-1", "expectedGeneration": 0}
+```
+
+`expectedGeneration` 为非负 JSON 整数且必须等于源卷当前的 `generation`，且源卷必须未绑定。成功返回 `201`：
+
+```json
+{"id":"snap-1","sourceVolumeId":"vol-1","poolId":"pool-a","sizeBytes":600,"sourceGeneration":0}
+```
+
+- 相同快照 `id`、相同源卷、相同源版本的重试返回 `200` 及原结果，不重复计量；源卷在此之后被删除，重试仍返回 `200`。
+- 相同快照 `id` 但源卷或源版本不同返回 `409 snapshot_exists`。
+- 源卷不存在返回 `404 volume_not_found`；源卷已绑定返回 `409 volume_in_use`。
+- 版本不符返回 `409 stale_generation`。
+- 容量不足返回 `409 insufficient_capacity`，且不遗留快照或占用。
+- 非法 id、缺失/非整数/负数的 `expectedGeneration`、未知字段等返回 `400 invalid_request`。
+
+### 列出、查询与删除
+
+- `GET /v1/snapshots` 返回 `{"items":[...]}`，按快照 id 升序。
+- `GET /v1/snapshots/{id}` 返回单个快照；不存在返回 `404 snapshot_not_found`。
+- `DELETE /v1/snapshots/{id}` 返回 `204` 并立即向源池归还容量；不存在返回 `404 snapshot_not_found`。
+
+只要池中仍存在快照（即使源卷已删除），删除池仍返回 `409 pool_not_empty`。
+
+## 克隆
+
+`POST /v1/snapshots/{id}/clones`
+
+```json
+{"id": "vol-copy", "poolId": "pool-b"}
+```
+
+基于快照创建一个独立卷：`sizeBytes` 与快照相同，`generation` 为 `0`，`binding` 为 `null`。克隆卷就是普通卷，可正常绑定、解绑、列卷与删除；容量计入**目标池**，允许跨池克隆。
+
+- 同一快照、相同卷 `id`、相同目标池的重试返回 `200` 及当前卷结果，不重复占用。
+- 卷 `id` 已被其他创建（直接建卷或来自其他快照的克隆）占用，或重试指向不同目标池时返回 `409 volume_exists`。
+- 快照不存在返回 `404 snapshot_not_found`；目标池不存在返回 `404 pool_not_found`。
+- 目标池容量不足返回 `409 insufficient_capacity`，失败不改变状态。
+- 非法 id、缺失字段、未知字段等返回 `400 invalid_request`。
+
+并发创建快照或克隆都不会重复计量或使池超配。
+
 ## 错误与路由
 
 错误响应统一为：
@@ -147,19 +198,21 @@ go run ./cmd/vaultgrid
 | HTTP | code | 场景 |
 | --- | --- | --- |
 | 400 | `invalid_request` | 未知字段、空设备集、非法 id、容量或版本非正/非整数、非法查询参数等，且不产生部分状态 |
-| 404 | `pool_not_found` | 查询、预留或删除不存在的池 |
-| 404 | `volume_not_found` | 查询、绑定、解绑或删除不存在的卷 |
+| 404 | `pool_not_found` | 查询、预留或删除不存在的池，或向不存在的目标池克隆 |
+| 404 | `volume_not_found` | 查询、绑定、解绑或删除不存在的卷，或为不存在的卷创建快照 |
+| 404 | `snapshot_not_found` | 查询、删除不存在的快照，或基于不存在的快照克隆 |
 | 404 | `not_found` | 未知路径 |
 | 405 | `method_not_allowed` | 不支持的方法，响应带正确的 `Allow` 头 |
 | 409 | `pool_exists` | 池 id 已存在 |
 | 409 | `device_in_use` | 设备已被其他池占用 |
-| 409 | `pool_not_empty` | 删除仍有预留或卷的池 |
+| 409 | `pool_not_empty` | 删除仍有预留、卷或快照的池 |
 | 409 | `idempotency_conflict` | 同 requestId 重试但 bytes 不同 |
-| 409 | `insufficient_capacity` | 预留或建卷超过池可用容量 |
-| 409 | `volume_exists` | 同卷 id 重试但参数不同 |
+| 409 | `insufficient_capacity` | 预留、建卷、快照或克隆超过池可用容量 |
+| 409 | `volume_exists` | 同卷 id 重试但参数不同，或克隆 id 已被其他创建/快照占用 |
 | 409 | `volume_already_bound` | 已绑定卷试图改绑其他节点 |
-| 409 | `volume_in_use` | 删除仍绑定在节点上的卷 |
-| 409 | `stale_generation` | 绑定/解绑时 expectedGeneration 与当前版本不符 |
+| 409 | `volume_in_use` | 删除或快照仍绑定在节点上的卷 |
+| 409 | `stale_generation` | 绑定/解绑或创建快照时 expectedGeneration 与当前版本不符 |
+| 409 | `snapshot_exists` | 同快照 id 重试但源卷或源版本不同 |
 
 ## 验证
 

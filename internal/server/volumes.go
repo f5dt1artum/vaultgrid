@@ -84,6 +84,12 @@ func (s *store) routeVolumes(w http.ResponseWriter, r *http.Request) {
 		default:
 			methodNotAllowed(w, http.MethodPut, http.MethodDelete)
 		}
+	case len(parts) == 2 && parts[1] == "snapshots":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		s.createSnapshot(w, r, parts[0])
 	default:
 		writeError(w, http.StatusNotFound, "not_found")
 	}
