@@ -193,6 +193,7 @@ func (s *store) createBucket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.buckets[in.ID] = &bucket{id: in.ID, poolID: in.PoolID, objects: make(map[string]*object)}
+	s.appendAudit(auditBucketCreated, bucketPath+"/"+in.ID, in.PoolID, 0)
 	writeJSON(w, http.StatusCreated, s.buckets[in.ID].view())
 }
 
@@ -213,6 +214,7 @@ func (s *store) deleteBucket(w http.ResponseWriter, id string) {
 		return
 	}
 	delete(s.buckets, id)
+	s.appendAudit(auditBucketDeleted, bucketPath+"/"+id, b.poolID, 0)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -363,6 +365,13 @@ func (s *store) putObject(w http.ResponseWriter, r *http.Request, bucketID, key 
 	}
 	b.objects[key] = &object{key: key, content: content, metadata: metadata, etag: etag, sizeBytes: size}
 	p.objectBytes += size - oldSize
+	// An overwrite is recorded even when the size delta is zero.
+	resource := bucketPath + "/" + bucketID + "/objects/" + key
+	if existing != nil {
+		s.appendAudit(auditObjectOverwritten, resource, b.poolID, size-oldSize)
+	} else {
+		s.appendAudit(auditObjectCreated, resource, b.poolID, size)
+	}
 	status := http.StatusCreated
 	if existing != nil {
 		status = http.StatusOK
@@ -424,10 +433,12 @@ func (s *store) deleteObject(w http.ResponseWriter, r *http.Request, bucketID, k
 		writeError(w, http.StatusNotFound, "bucket_not_found")
 		return
 	}
-	// Deleting an unknown or already-deleted object is a success.
+	// Deleting an unknown or already-deleted object is a success with no
+	// state change, so only a real deletion records an event.
 	if o, exists := b.objects[key]; exists {
 		s.pools[b.poolID].objectBytes -= o.sizeBytes
 		delete(b.objects, key)
+		s.appendAudit(auditObjectDeleted, bucketPath+"/"+bucketID+"/objects/"+key, b.poolID, -o.sizeBytes)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

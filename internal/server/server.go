@@ -78,6 +78,14 @@ func (s *store) route(w http.ResponseWriter, r *http.Request) {
 		s.capacityReport(w, r)
 	case strings.HasPrefix(r.URL.Path, capacityReportPath+"/"):
 		writeError(w, http.StatusNotFound, "not_found")
+	case r.URL.Path == auditEventsPath:
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		s.listAuditEvents(w, r)
+	case strings.HasPrefix(r.URL.Path, auditEventsPath+"/"):
+		writeError(w, http.StatusNotFound, "not_found")
 	default:
 		writeError(w, http.StatusNotFound, "not_found")
 	}

@@ -172,6 +172,7 @@ func (s *store) createSnapshot(w http.ResponseWriter, r *http.Request, volumeID 
 	}
 	s.snapshots[in.ID] = snap
 	p.snapshotBytes += v.sizeBytes
+	s.appendAudit(auditSnapshotCreated, snapshotPath+"/"+in.ID, v.poolID, v.sizeBytes)
 	writeJSON(w, http.StatusCreated, snap.view())
 }
 
@@ -189,6 +190,7 @@ func (s *store) deleteSnapshot(w http.ResponseWriter, id string) {
 	}
 	s.pools[snap.poolID].snapshotBytes -= snap.sizeBytes
 	delete(s.snapshots, id)
+	s.appendAudit(auditSnapshotDeleted, snapshotPath+"/"+id, snap.poolID, -snap.sizeBytes)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -235,5 +237,6 @@ func (s *store) createClone(w http.ResponseWriter, r *http.Request, snapshotID s
 	v := &volume{id: in.ID, poolID: in.PoolID, sizeBytes: snap.sizeBytes, cloneSource: snapshotID}
 	s.volumes[in.ID] = v
 	target.volumeBytes += snap.sizeBytes
+	s.appendAudit(auditCloneCreated, volumePath+"/"+in.ID, in.PoolID, snap.sizeBytes)
 	writeJSON(w, http.StatusCreated, v.view())
 }

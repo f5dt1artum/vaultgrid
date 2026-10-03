@@ -106,6 +106,11 @@ type store struct {
 	snapshots   map[string]*snapshot
 	buckets     map[string]*bucket
 	deviceOwner map[string]string
+	// auditEvents is the append-only audit log; auditSeq is the sequence of
+	// its last entry (0 while empty). Both are mutated under mu, together with
+	// the business state each event describes.
+	auditEvents []auditEvent
+	auditSeq    int64
 }
 
 func newStore() *store {
@@ -207,6 +212,7 @@ func (s *store) createPool(w http.ResponseWriter, r *http.Request) {
 	for _, d := range devices {
 		s.deviceOwner[d.ID] = in.ID
 	}
+	s.appendAudit(auditPoolCreated, storagePoolPath+"/"+in.ID, in.ID, 0)
 	writeJSON(w, http.StatusCreated, p.view())
 }
 
@@ -238,6 +244,7 @@ func (s *store) deletePool(w http.ResponseWriter, id string) {
 		delete(s.deviceOwner, d.ID)
 	}
 	delete(s.pools, id)
+	s.appendAudit(auditPoolDeleted, storagePoolPath+"/"+id, id, 0)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -273,6 +280,8 @@ func (s *store) createReservation(w http.ResponseWriter, r *http.Request, poolID
 		return
 	}
 	p.reservations[in.RequestID] = reservation{requestID: in.RequestID, bytes: in.Bytes}
+	s.appendAudit(auditReservationCreated,
+		storagePoolPath+"/"+poolID+"/reservations/"+in.RequestID, poolID, in.Bytes)
 	writeJSON(w, http.StatusCreated, reservationView{PoolID: poolID, RequestID: in.RequestID, Bytes: in.Bytes})
 }
 
@@ -288,7 +297,12 @@ func (s *store) deleteReservation(w http.ResponseWriter, poolID, requestID strin
 		writeError(w, http.StatusNotFound, "pool_not_found")
 		return
 	}
-	// Deleting an unknown or already-deleted reservation is a success.
-	delete(p.reservations, requestID)
+	// Deleting an unknown or already-deleted reservation is a success with
+	// no state change, so only a real deletion records an event.
+	if r, existed := p.reservations[requestID]; existed {
+		delete(p.reservations, requestID)
+		s.appendAudit(auditReservationDeleted,
+			storagePoolPath+"/"+poolID+"/reservations/"+requestID, poolID, -r.bytes)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }

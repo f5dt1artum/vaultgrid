@@ -2,7 +2,7 @@
 
 这是一个面向存储与数据管理的块/对象存储与卷管理控制面。长期目标是提供存储池与卷生命周期、S3 风格对象接口、纠删码与多副本放置、一致性哈希与再平衡、快照与克隆、完整性自愈和配额，把存储控制面沉淀为可复用服务。
 
-仓库采用 Go。当前提供进程健康检查、存储池目录、池级容量预留、卷生命周期与单节点独占绑定、内存态卷快照与基于快照的跨池克隆、S3 风格的桶与对象接口，以及池级容量报表导出；每个能力都定义可观察的公共行为、兼容边界和失败语义，不依赖未公开内部 API。所有状态保存在内存中，进程重启后清空。
+仓库采用 Go。当前提供进程健康检查、存储池目录、池级容量预留、卷生命周期与单节点独占绑定、内存态卷快照与基于快照的跨池克隆、S3 风格的桶与对象接口、池级容量报表导出以及内存态审计事件；每个能力都定义可观察的公共行为、兼容边界和失败语义，不依赖未公开内部 API。所有状态保存在内存中，进程重启后清空。
 
 ## 启动
 
@@ -264,6 +264,40 @@ poolId,rawCapacityBytes,reservationBytes,volumeBytes,snapshotBytes,objectBytes,a
 只输出同序池行（不含汇总行），无池时仅输出表头，数字为十进制整数，与 JSON 口径一致。
 
 `poolId` 不符合 id 规则、`format` 不是 `json` 或 `csv`、参数重复、出现未知参数或参数无值时返回 `400 invalid_request`；合法但不存在的 `poolId` 返回 `404 pool_not_found`。该路径仅允许 `GET`，其他方法返回 `405 method_not_allowed` 且带 `Allow: GET`；额外子路径返回 `404 not_found`。报表只读内存、无副作用，重启后遵循现有清空语义。
+
+## 审计事件
+
+所有真正改变状态的成功请求都会向内存态审计日志追加一条事件；失败、只读或成功但未改变状态的请求（含各类幂等重试、已绑定卷的同节点重复绑定、未绑定卷的解绑、删除从未存在的预留或对象）不记录。日志与业务状态及容量计数在同一临界区原子提交：响应成功后立即可查，请求失败绝不遗留事件。事件仅存于内存，进程重启后清空。
+
+每条事件为：
+
+```json
+{"sequence":1,"action":"pool.created","resource":"/v1/storage-pools/pool-a","poolId":"pool-a","bytesDelta":0}
+```
+
+- `sequence` 从 1 起连续递增；并发请求按实际提交状态的先后编号。
+- `action` 取值：`pool.created`、`pool.deleted`、`reservation.created`、`reservation.deleted`、`volume.created`、`volume.deleted`、`volume.bound`、`volume.unbound`、`snapshot.created`、`snapshot.deleted`、`clone.created`、`bucket.created`、`bucket.deleted`、`object.created`、`object.overwritten`、`object.deleted`。
+- `resource` 是事件对应资源的公开路径（预留为 `/v1/storage-pools/{id}/reservations/{requestId}`，绑定为 `/v1/volumes/{id}/binding`，对象为 `/v1/buckets/{id}/objects/{key}`，克隆卷为 `/v1/volumes/{id}`）。
+- `poolId` 是事件所属池：卷、快照、桶、预留、对象归属其所在池；克隆计入目标池。
+- `bytesDelta` 是该次提交对池 `allocatedBytes` 的有符号变化：创建为正、删除为负、容量无关的动作（建删池、建删桶、绑定解绑）为 `0`。对象覆盖为 `新大小-旧大小`；**即使容量差为零也记录 `object.overwritten`**。
+
+### 查询事件
+
+`GET /v1/audit-events` 只接受三个可选查询参数：
+
+- `after`：非负十进制整数，缺省 `0`；只返回序号严格大于它的事件。
+- `limit`：`1` 至 `1000` 的十进制整数，缺省 `100`；每页至多返回该数量。
+- `poolId`：沿用既有 id 规则，缺省不过滤；只返回属于该池的事件。
+
+响应为：
+
+```json
+{"items":[...],"nextAfter":0,"hasMore":false}
+```
+
+`items` 按 `sequence` 升序，取序号大于 `after` 且匹配池的至多 `limit` 条。`nextAfter` 取本页末项序号，空页取请求中的 `after`。`hasMore` 表示在同一读取状态下其后仍有匹配项；整页来自单一一致状态。`after` 超过当前最大序号时返回空页（`items` 为空、`nextAfter` 为该 `after`、`hasMore` 为 `false`）。翻页时把上一页的 `nextAfter` 作为下一页的 `after`。
+
+`after` 非十进制非负整数、`limit` 不在 `1..1000`、`poolId` 不符合 id 规则，以及未知、重复或缺值参数均返回 `400 invalid_request`；`poolId` 合法但池不存在（含已删除）返回 `404 pool_not_found`。该路径仅允许 `GET`，其他方法返回 `405 method_not_allowed` 且带 `Allow: GET`；额外子路径返回 `404 not_found`。
 
 ## 错误与路由
 
