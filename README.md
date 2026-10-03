@@ -94,7 +94,7 @@ go run ./cmd/vaultgrid
 {"id": "vol-1", "poolId": "pool-a", "sizeBytes": 600, "generation": 0, "binding": null}
 ```
 
-- 相同 `id`、`poolId`、`sizeBytes` 重试返回 `200` 及当前卷结果，不重复计量。
+- 相同 `id`、`poolId`、`sizeBytes` 重试返回 `200` 及当前卷结果，不重复计量（比对的是原始创建参数：卷即使经调整改变了当前大小，原始请求重放仍返回 `200` 及当前卷表示）。
 - 相同 `id` 但参数不同返回 `409 volume_exists`。
 - 池不存在返回 `404 pool_not_found`。
 - 容量不足返回 `409 insufficient_capacity`；并发创建绝不会使池超配，失败不遗留卷或占用。
@@ -135,6 +135,29 @@ go run ./cmd/vaultgrid
 - 不存在返回 `404 volume_not_found`。
 
 卷存在时删除所属池仍返回 `409 pool_not_empty`。
+
+### 调整卷大小
+
+`PUT /v1/volumes/{id}/size`
+
+```json
+{"sizeBytes": 900, "expectedGeneration": 2}
+```
+
+该子资源只允许 `PUT`，且不接受任何查询参数。`sizeBytes` 为正 JSON 整数，`expectedGeneration` 为非负 JSON 整数且必须等于卷当前的 `generation`，卷必须未绑定：
+
+- 新大小与当前不同：返回 `200` 及当前卷表示，`sizeBytes` 更新，`generation` 加一，`binding` 保持原值（未绑定时仍为 `null`）。
+- 新大小与当前相同且版本匹配：返回 `200` 及当前卷表示，`generation`、容量计量与审计日志均不变。
+- 卷已绑定：返回 `409 volume_in_use`，该判断优先于版本判断。
+- 版本不符：返回 `409 stale_generation`；使用同一当前 generation 的并发请求至多一个能改变大小。
+- 卷不存在返回 `404 volume_not_found`。
+- 扩容先检查租户配额、再检查池容量：分别返回 `409 tenant_quota_exceeded` 与 `409 insufficient_capacity`；缩容不受这两项限制。
+- 正文缺字段、未知字段、数值非法、卷 id 非法或携带查询参数返回 `400 invalid_request`。
+- 任何失败都不改变卷、池容量、租户用量或审计日志。
+
+检查与提交在同一临界区内完成，因此与绑定、删除、快照创建或其他容量分配并发时不会超配或重扣。大小改变后，池的 `volumeBytes`、`allocatedBytes`、`availableBytes`、租户配额用量以及 JSON、CSV 容量报表立即按有符号差额更新；审计日志原子追加一条 `volume.resized` 事件，`resource` 为 `/v1/volumes/{id}/size`，`bytesDelta` 为有符号差额（扩容为正、缩容为负），同大小请求与失败不记录事件。
+
+已有快照保留创建时的大小、源代数与源池占用，不受源卷调整影响；后续克隆继续使用快照大小。克隆卷与普通卷一样支持调整。卷被调整后，原创建参数的幂等重放仍返回 `200` 及当前卷表示（创建幂等只比对 `id`、`poolId` 与租户），其他参数仍返回 `409 volume_exists`。
 
 ## 快照
 
@@ -270,7 +293,7 @@ go run ./cmd/vaultgrid
 
 ### 配额执行
 
-容量增加（建预留、建卷、建快照、克隆、写对象）先判定幂等，再在同一临界区内原子检查租户额度与池容量：超出租户配额返回 `409 tenant_quota_exceeded`，池容量不足仍返回 `409 insufficient_capacity`；失败不留资源、计量或审计残留，并发不会突破任一上限。同标识同租户的重试保留原幂等结果；租户不同则按既有规则返回 `idempotency_conflict`、`volume_exists` 或 `bucket_exists`。旧客户端不传头时一切行为不变（归属 `default`）。
+容量增加（建预留、建卷、卷扩容、建快照、克隆、写对象）先判定幂等，再在同一临界区内原子检查租户额度与池容量：超出租户配额返回 `409 tenant_quota_exceeded`，池容量不足仍返回 `409 insufficient_capacity`；失败不留资源、计量或审计残留，并发不会突破任一上限。卷缩容释放租户用量且不受这两项限制。同标识同租户的重试保留原幂等结果；租户不同则按既有规则返回 `idempotency_conflict`、`volume_exists` 或 `bucket_exists`。旧客户端不传头时一切行为不变（归属 `default`）。
 
 ## 容量报表
 
@@ -308,10 +331,10 @@ poolId,rawCapacityBytes,reservationBytes,volumeBytes,snapshotBytes,objectBytes,a
 ```
 
 - `sequence` 从 1 起连续递增；并发请求按实际提交状态的先后编号。
-- `action` 取值：`pool.created`、`pool.deleted`、`reservation.created`、`reservation.deleted`、`volume.created`、`volume.deleted`、`volume.bound`、`volume.unbound`、`snapshot.created`、`snapshot.deleted`、`clone.created`、`bucket.created`、`bucket.deleted`、`object.created`、`object.overwritten`、`object.deleted`、`tenant-quota.created`、`tenant-quota.updated`、`tenant-quota.deleted`。
-- `resource` 是事件对应资源的公开路径（预留为 `/v1/storage-pools/{id}/reservations/{requestId}`，绑定为 `/v1/volumes/{id}/binding`，对象为 `/v1/buckets/{id}/objects/{key}`，克隆卷为 `/v1/volumes/{id}`，租户配额为 `/v1/storage-pools/{id}/tenant-quotas/{tenantId}`）。
+- `action` 取值：`pool.created`、`pool.deleted`、`reservation.created`、`reservation.deleted`、`volume.created`、`volume.deleted`、`volume.bound`、`volume.unbound`、`volume.resized`、`snapshot.created`、`snapshot.deleted`、`clone.created`、`bucket.created`、`bucket.deleted`、`object.created`、`object.overwritten`、`object.deleted`、`tenant-quota.created`、`tenant-quota.updated`、`tenant-quota.deleted`。
+- `resource` 是事件对应资源的公开路径（预留为 `/v1/storage-pools/{id}/reservations/{requestId}`，绑定为 `/v1/volumes/{id}/binding`，卷大小调整为 `/v1/volumes/{id}/size`，对象为 `/v1/buckets/{id}/objects/{key}`，克隆卷为 `/v1/volumes/{id}`，租户配额为 `/v1/storage-pools/{id}/tenant-quotas/{tenantId}`）。
 - `poolId` 是事件所属池：卷、快照、桶、预留、对象、租户配额归属其所在池；克隆计入目标池。
-- `bytesDelta` 是该次提交对池 `allocatedBytes` 的有符号变化：创建为正、删除为负、容量无关的动作（建删池、建删桶、绑定解绑、租户配额增删改）为 `0`。对象覆盖为 `新大小-旧大小`；**即使容量差为零也记录 `object.overwritten`**。
+- `bytesDelta` 是该次提交对池 `allocatedBytes` 的有符号变化：创建为正、删除为负、容量无关的动作（建删池、建删桶、绑定解绑、租户配额增删改）为 `0`。对象覆盖为 `新大小-旧大小`；**即使容量差为零也记录 `object.overwritten`**。卷调整为 `新大小-旧大小`，同大小请求不记录 `volume.resized`。
 
 ### 查询事件
 
@@ -343,7 +366,7 @@ poolId,rawCapacityBytes,reservationBytes,volumeBytes,snapshotBytes,objectBytes,a
 | --- | --- | --- |
 | 400 | `invalid_request` | 未知字段、空设备集、非法 id、容量或版本非正/非整数、非法 key/元数据/查询参数等，且不产生部分状态 |
 | 404 | `pool_not_found` | 查询、预留或删除不存在的池，向不存在的目标池克隆、建桶，或按不存在的池导出报表 |
-| 404 | `volume_not_found` | 查询、绑定、解绑或删除不存在的卷，或为不存在的卷创建快照 |
+| 404 | `volume_not_found` | 查询、绑定、解绑、删除或调整大小不存在的卷，或为不存在的卷创建快照 |
 | 404 | `snapshot_not_found` | 查询、删除不存在的快照，或基于不存在的快照克隆 |
 | 404 | `bucket_not_found` | 查询、删除不存在的桶，或向不存在的桶读写对象 |
 | 404 | `object_not_found` | 读取不存在的对象 |
@@ -354,16 +377,16 @@ poolId,rawCapacityBytes,reservationBytes,volumeBytes,snapshotBytes,objectBytes,a
 | 409 | `device_in_use` | 设备已被其他池占用 |
 | 409 | `pool_not_empty` | 删除仍有预留、卷、快照或桶的池 |
 | 409 | `idempotency_conflict` | 同 requestId 重试但 bytes 不同 |
-| 409 | `insufficient_capacity` | 预留、建卷、快照、克隆或写对象超过池可用容量 |
+| 409 | `insufficient_capacity` | 预留、建卷、卷扩容、快照、克隆或写对象超过池可用容量（缩容不受限） |
 | 409 | `volume_exists` | 同卷 id 重试但参数不同，或克隆 id 已被其他创建/快照占用 |
 | 409 | `volume_already_bound` | 已绑定卷试图改绑其他节点 |
-| 409 | `volume_in_use` | 删除或快照仍绑定在节点上的卷 |
-| 409 | `stale_generation` | 绑定/解绑或创建快照时 expectedGeneration 与当前版本不符 |
+| 409 | `volume_in_use` | 删除、创建快照或调整大小仍绑定在节点上的卷（调整大小时优先于版本判断） |
+| 409 | `stale_generation` | 绑定/解绑、创建快照或调整大小时 expectedGeneration 与当前版本不符 |
 | 409 | `snapshot_exists` | 同快照 id 重试但源卷或源版本不同 |
 | 409 | `bucket_exists` | 同桶 id 重试但 poolId 不同 |
 | 409 | `bucket_not_empty` | 删除仍有对象的桶 |
 | 409 | `quota_below_usage` | 租户配额限额低于该租户当前用量 |
-| 409 | `tenant_quota_exceeded` | 容量增加超出该租户在池内的配额 |
+| 409 | `tenant_quota_exceeded` | 容量增加（建预留、建卷、卷扩容、建快照、克隆、写对象）超出该租户在池内的配额（缩容不受限） |
 | 412 | `precondition_failed` | 条件写入的 If-Match / If-None-Match 不满足 |
 
 ## 验证

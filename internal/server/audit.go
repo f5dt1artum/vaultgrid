@@ -22,6 +22,7 @@ const (
 	auditVolumeDeleted      auditAction = "volume.deleted"
 	auditVolumeBound        auditAction = "volume.bound"
 	auditVolumeUnbound      auditAction = "volume.unbound"
+	auditVolumeResized      auditAction = "volume.resized"
 	auditSnapshotCreated    auditAction = "snapshot.created"
 	auditSnapshotDeleted    auditAction = "snapshot.deleted"
 	auditCloneCreated       auditAction = "clone.created"

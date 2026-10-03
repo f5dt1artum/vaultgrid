@@ -248,7 +248,7 @@ func (s *store) createClone(w http.ResponseWriter, r *http.Request, snapshotID s
 		writeError(w, http.StatusConflict, "insufficient_capacity")
 		return
 	}
-	v := &volume{id: in.ID, poolID: in.PoolID, sizeBytes: snap.sizeBytes, cloneSource: snapshotID, tenant: snap.tenant}
+	v := &volume{id: in.ID, poolID: in.PoolID, sizeBytes: snap.sizeBytes, createdSizeBytes: snap.sizeBytes, cloneSource: snapshotID, tenant: snap.tenant}
 	s.volumes[in.ID] = v
 	target.volumeBytes += snap.sizeBytes
 	target.tenantUsed[snap.tenant] += snap.sizeBytes

@@ -19,6 +19,11 @@ type bindingInput struct {
 	ExpectedGeneration *int64 `json:"expectedGeneration"`
 }
 
+type resizeVolumeInput struct {
+	SizeBytes          int64  `json:"sizeBytes"`
+	ExpectedGeneration *int64 `json:"expectedGeneration"`
+}
+
 // bindingView is the public representation of a volume binding.
 type bindingView struct {
 	NodeID string `json:"nodeId"`
@@ -84,6 +89,12 @@ func (s *store) routeVolumes(w http.ResponseWriter, r *http.Request) {
 		default:
 			methodNotAllowed(w, http.MethodPut, http.MethodDelete)
 		}
+	case len(parts) == 2 && parts[1] == "size":
+		if r.Method != http.MethodPut {
+			methodNotAllowed(w, http.MethodPut)
+			return
+		}
+		s.putVolumeSize(w, r, parts[0])
 	case len(parts) == 2 && parts[1] == "snapshots":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
@@ -144,7 +155,7 @@ func (s *store) createVolume(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existing, dup := s.volumes[in.ID]; dup {
-		if existing.poolID == in.PoolID && existing.sizeBytes == in.SizeBytes && existing.tenant == tenant {
+		if existing.poolID == in.PoolID && existing.createdSizeBytes == in.SizeBytes && existing.tenant == tenant {
 			writeJSON(w, http.StatusOK, existing.view())
 			return
 		}
@@ -166,7 +177,7 @@ func (s *store) createVolume(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "insufficient_capacity")
 		return
 	}
-	v := &volume{id: in.ID, poolID: in.PoolID, sizeBytes: in.SizeBytes, tenant: tenant}
+	v := &volume{id: in.ID, poolID: in.PoolID, sizeBytes: in.SizeBytes, createdSizeBytes: in.SizeBytes, tenant: tenant}
 	s.volumes[in.ID] = v
 	p.volumeBytes += in.SizeBytes
 	p.tenantUsed[tenant] += in.SizeBytes
@@ -231,6 +242,78 @@ func (s *store) putBinding(w http.ResponseWriter, r *http.Request, volumeID stri
 	}
 	// A same-node, same-generation PUT is an idempotent no-op that returns
 	// the current representation without bumping the generation.
+	writeJSON(w, http.StatusOK, v.view())
+}
+
+// putVolumeSize handles PUT /v1/volumes/{id}/size. It changes an existing
+// volume's size under optimistic concurrency: expectedGeneration must name the
+// volume's current generation, and the check plus the commit run inside one
+// store-lock critical section, so concurrent requests using the same
+// generation can have at most one winner.
+//
+// A bound volume is rejected with volume_in_use before the generation is
+// compared. Growth is charged to the owning tenant's quota first and then to
+// pool capacity; shrinkage is subject to neither. A request naming the current
+// size is a successful no-op: no generation bump, no accounting and no audit
+// event.
+func (s *store) putVolumeSize(w http.ResponseWriter, r *http.Request, volumeID string) {
+	// The sub-resource accepts no query string at all (ForceQuery catches a
+	// bare trailing "?" whose RawQuery is empty).
+	if r.URL.ForceQuery || r.URL.RawQuery != "" {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	var in resizeVolumeInput
+	if !decodeRequest(r, &in) {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if !validID(volumeID) || in.SizeBytes <= 0 || in.ExpectedGeneration == nil || *in.ExpectedGeneration < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	expected := *in.ExpectedGeneration
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.volumes[volumeID]
+	if !ok {
+		writeError(w, http.StatusNotFound, "volume_not_found")
+		return
+	}
+	if v.binding != "" {
+		writeError(w, http.StatusConflict, "volume_in_use")
+		return
+	}
+	if v.generation != expected {
+		writeError(w, http.StatusConflict, "stale_generation")
+		return
+	}
+	p := s.pools[v.poolID]
+	delta := in.SizeBytes - v.sizeBytes
+	if delta > 0 {
+		// Growth is charged to the owning tenant's quota before pool capacity,
+		// matching volume creation; shrinkage is subject to neither.
+		if p.tenantQuotaExceeded(v.tenant, delta) {
+			writeError(w, http.StatusConflict, "tenant_quota_exceeded")
+			return
+		}
+		if p.allocated() > p.rawCapacity-delta {
+			writeError(w, http.StatusConflict, "insufficient_capacity")
+			return
+		}
+	}
+	if delta != 0 {
+		// delta is positive for growth and negative for shrinkage, so a single
+		// signed adjustment covers the pool and the tenant's usage.
+		p.volumeBytes += delta
+		p.tenantUsed[v.tenant] += delta
+		v.sizeBytes = in.SizeBytes
+		v.generation++
+		s.appendAudit(auditVolumeResized, volumePath+"/"+volumeID+"/size", v.poolID, delta)
+	}
+	// delta == 0 is an idempotent no-op: return the current representation
+	// without bumping the generation, touching accounting or appending an event.
 	writeJSON(w, http.StatusOK, v.view())
 }
 

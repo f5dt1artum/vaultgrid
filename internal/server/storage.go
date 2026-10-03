@@ -69,19 +69,23 @@ type pool struct {
 }
 
 // volume is a capacity allocation inside a pool with an optional exclusive
-// node binding. generation is bumped on every binding state change.
-// cloneSource records the snapshot a volume was cloned from ("" for a volume
-// created directly) so clone retries can be told apart from foreign ids.
-// tenant is the owning tenant; its sizeBytes is charged to the tenant's usage
-// in the pool.
+// node binding. generation is bumped on every binding state change and every
+// resize. cloneSource records the snapshot a volume was cloned from ("" for a
+// volume created directly) so clone retries can be told apart from foreign ids.
+// createdSizeBytes records the size from the original creation request (the
+// snapshot size for clones); idempotent create replays match it rather than
+// the live sizeBytes, so resizing a volume never turns a faithful retry into a
+// volume_exists conflict. tenant is the owning tenant; its current sizeBytes is
+// charged to the tenant's usage in the pool.
 type volume struct {
-	id          string
-	poolID      string
-	sizeBytes   int64
-	generation  int64
-	binding     string // "" when unbound
-	cloneSource string // snapshot id when produced via a clone
-	tenant      string
+	id               string
+	poolID           string
+	sizeBytes        int64
+	createdSizeBytes int64
+	generation       int64
+	binding          string // "" when unbound
+	cloneSource      string // snapshot id when produced via a clone
+	tenant           string
 }
 
 func (p *pool) allocated() int64 {
