@@ -2,7 +2,7 @@
 
 这是一个面向存储与数据管理的块/对象存储与卷管理控制面。长期目标是提供存储池与卷生命周期、S3 风格对象接口、纠删码与多副本放置、一致性哈希与再平衡、快照与克隆、完整性自愈和配额，把存储控制面沉淀为可复用服务。
 
-仓库采用 Go。当前提供进程健康检查、存储池目录、池级容量预留、卷生命周期与单节点独占绑定，以及内存态卷快照与基于快照的跨池克隆；每个能力都定义可观察的公共行为、兼容边界和失败语义，不依赖未公开内部 API。所有状态保存在内存中，进程重启后清空。
+仓库采用 Go。当前提供进程健康检查、存储池目录、池级容量预留、卷生命周期与单节点独占绑定、内存态卷快照与基于快照的跨池克隆，以及 S3 风格的桶与对象接口；每个能力都定义可观察的公共行为、兼容边界和失败语义，不依赖未公开内部 API。所有状态保存在内存中，进程重启后清空。
 
 ## 启动
 
@@ -187,6 +187,59 @@ go run ./cmd/vaultgrid
 
 并发创建快照或克隆都不会重复计量或使池超配。
 
+## 桶与对象
+
+桶是绑定到某个池的对象命名空间，桶 id 遵循前述 id 规则。对象字节与预留、卷、快照共享同一池容量预算，计入 `allocatedBytes`。
+
+### 创建桶（幂等）
+
+`POST /v1/buckets`
+
+```json
+{"id": "bucket-1", "poolId": "pool-a"}
+```
+
+成功返回 `201`：
+
+```json
+{"id": "bucket-1", "poolId": "pool-a", "objectCount": 0, "bytesUsed": 0}
+```
+
+- 相同 `id`、`poolId` 重试返回 `200` 及当前桶结果。
+- 相同 `id` 但 `poolId` 不同返回 `409 bucket_exists`。
+- 池不存在返回 `404 pool_not_found`。
+
+### 列出、查询与删除
+
+- `GET /v1/buckets` 返回 `{"items":[...]}`，按桶 id 升序。
+- `GET /v1/buckets/{id}` 返回单个桶；不存在返回 `404 bucket_not_found`。
+- `DELETE /v1/buckets/{id}`：空桶返回 `204`；仍有对象返回 `409 bucket_not_empty`；不存在返回 `404 bucket_not_found`。
+
+只要池中仍存在桶（即使为空），删除池仍返回 `409 pool_not_empty`。
+
+### 写入对象
+
+`PUT /v1/buckets/{bucketId}/objects/{key}` 以原始请求正文为内容。key 为 `objects/` 后余下路径一次 URL 解码的结果，允许斜杠，须为 1 至 1024 个 UTF-8 字节且无控制字符。内容可为空。`X-Vaultgrid-Meta-*` 请求头作为元数据保存，覆盖写入时整体替换。
+
+成功响应带 `ETag` 头，正文为：
+
+```json
+{"key": "a/b.txt", "sizeBytes": 3, "metadata": {"Author": "me"}, "etag": "\"...\""}
+```
+
+`etag` 为内容 SHA-256 的带双引号小写十六进制。首次写入返回 `201`，覆盖返回 `200`；覆盖只按大小差额调整池占用。容量不足返回 `409 insufficient_capacity`，旧对象及元数据不变。
+
+支持条件写入：`If-Match: <当前ETag>` 或 `If-None-Match: *`（仅当对象不存在时写入）。条件不满足返回 `412 precondition_failed`；两者并用或其他形式（如 `If-Match: *`、`If-None-Match: <etag>`）返回 `400 invalid_request`。
+
+### 读取、列举与删除对象
+
+- `GET /v1/buckets/{bucketId}/objects/{key}` 返回原始字节，带 `ETag` 与 `X-Vaultgrid-Meta-*` 头；对象不存在返回 `404 object_not_found`。
+- `HEAD` 同上但无正文。
+- `GET /v1/buckets/{bucketId}/objects` 返回 `{"items":[...]}`，按 key 升序的对象摘要；只接受一个 `prefix` 查询参数，其他或重复参数返回 `400 invalid_request`。
+- `DELETE /v1/buckets/{bucketId}/objects/{key}` 返回 `204` 并释放容量；删除不存在（含从未存在）的对象仍为 `204`；桶不存在返回 `404 bucket_not_found`。
+
+非法 key、元数据、查询参数、未知字段或格式错误返回 `400 invalid_request`。并发写删不会超配、重扣或残留部分状态。
+
 ## 错误与路由
 
 错误响应统一为：
@@ -197,22 +250,27 @@ go run ./cmd/vaultgrid
 
 | HTTP | code | 场景 |
 | --- | --- | --- |
-| 400 | `invalid_request` | 未知字段、空设备集、非法 id、容量或版本非正/非整数、非法查询参数等，且不产生部分状态 |
-| 404 | `pool_not_found` | 查询、预留或删除不存在的池，或向不存在的目标池克隆 |
+| 400 | `invalid_request` | 未知字段、空设备集、非法 id、容量或版本非正/非整数、非法 key/元数据/查询参数等，且不产生部分状态 |
+| 404 | `pool_not_found` | 查询、预留或删除不存在的池，或向不存在的目标池克隆、建桶 |
 | 404 | `volume_not_found` | 查询、绑定、解绑或删除不存在的卷，或为不存在的卷创建快照 |
 | 404 | `snapshot_not_found` | 查询、删除不存在的快照，或基于不存在的快照克隆 |
+| 404 | `bucket_not_found` | 查询、删除不存在的桶，或向不存在的桶读写对象 |
+| 404 | `object_not_found` | 读取不存在的对象 |
 | 404 | `not_found` | 未知路径 |
 | 405 | `method_not_allowed` | 不支持的方法，响应带正确的 `Allow` 头 |
 | 409 | `pool_exists` | 池 id 已存在 |
 | 409 | `device_in_use` | 设备已被其他池占用 |
-| 409 | `pool_not_empty` | 删除仍有预留、卷或快照的池 |
+| 409 | `pool_not_empty` | 删除仍有预留、卷、快照或桶的池 |
 | 409 | `idempotency_conflict` | 同 requestId 重试但 bytes 不同 |
-| 409 | `insufficient_capacity` | 预留、建卷、快照或克隆超过池可用容量 |
+| 409 | `insufficient_capacity` | 预留、建卷、快照、克隆或写对象超过池可用容量 |
 | 409 | `volume_exists` | 同卷 id 重试但参数不同，或克隆 id 已被其他创建/快照占用 |
 | 409 | `volume_already_bound` | 已绑定卷试图改绑其他节点 |
 | 409 | `volume_in_use` | 删除或快照仍绑定在节点上的卷 |
 | 409 | `stale_generation` | 绑定/解绑或创建快照时 expectedGeneration 与当前版本不符 |
 | 409 | `snapshot_exists` | 同快照 id 重试但源卷或源版本不同 |
+| 409 | `bucket_exists` | 同桶 id 重试但 poolId 不同 |
+| 409 | `bucket_not_empty` | 删除仍有对象的桶 |
+| 412 | `precondition_failed` | 条件写入的 If-Match / If-None-Match 不满足 |
 
 ## 验证
 

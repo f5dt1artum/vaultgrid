@@ -28,25 +28,33 @@ type health struct {
 }
 
 // Handler returns the HTTP surface served by VaultGrid.
+//
+// Dispatch is a plain handler rather than http.ServeMux: the mux cleans
+// paths (collapsing "//" and resolving "..") before they reach the handler,
+// which would corrupt object keys, since a key is the raw remainder of the
+// path after "objects/".
 func Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", http.MethodGet)
-			http.Error(w, `{"error":{"code":"method_not_allowed"}}`, http.StatusMethodNotAllowed)
+	s := newStore()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			if r.Method != http.MethodGet {
+				w.Header().Set("Allow", http.MethodGet)
+				writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+				return
+			}
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			_ = json.NewEncoder(w).Encode(health{Status: "ok", Service: "vaultgrid", Version: Version})
 			return
 		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		_ = json.NewEncoder(w).Encode(health{Status: "ok", Service: "vaultgrid", Version: Version})
+		s.route(w, r)
 	})
-	mux.HandleFunc("/", newStore().route)
-	return mux
 }
 
 const (
 	storagePoolPath = "/v1/storage-pools"
 	volumePath      = "/v1/volumes"
 	snapshotPath    = "/v1/snapshots"
+	bucketPath      = "/v1/buckets"
 )
 
 // route dispatches every non-healthz request. Paths it does not recognise
@@ -59,6 +67,8 @@ func (s *store) route(w http.ResponseWriter, r *http.Request) {
 		s.routeSnapshots(w, r)
 	case r.URL.Path == storagePoolPath || strings.HasPrefix(r.URL.Path, storagePoolPath+"/"):
 		s.routeStoragePools(w, r)
+	case r.URL.Path == bucketPath || strings.HasPrefix(r.URL.Path, bucketPath+"/"):
+		s.routeBuckets(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "not_found")
 	}
