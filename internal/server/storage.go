@@ -106,6 +106,12 @@ type store struct {
 	snapshots   map[string]*snapshot
 	buckets     map[string]*bucket
 	deviceOwner map[string]string
+	// events is the append-only audit log. auditSeq is its last assigned
+	// sequence (0 before the first event). Events share the store lock, so an
+	// event commits atomically with the business state and capacity it
+	// describes. The log is purely in-memory and cleared on restart.
+	events   []auditEvent
+	auditSeq int64
 }
 
 func newStore() *store {
@@ -207,6 +213,7 @@ func (s *store) createPool(w http.ResponseWriter, r *http.Request) {
 	for _, d := range devices {
 		s.deviceOwner[d.ID] = in.ID
 	}
+	s.recordEvent(actionPoolCreated, storagePoolPath+"/"+in.ID, in.ID, 0)
 	writeJSON(w, http.StatusCreated, p.view())
 }
 
@@ -238,6 +245,7 @@ func (s *store) deletePool(w http.ResponseWriter, id string) {
 		delete(s.deviceOwner, d.ID)
 	}
 	delete(s.pools, id)
+	s.recordEvent(actionPoolDeleted, storagePoolPath+"/"+id, id, 0)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -273,6 +281,8 @@ func (s *store) createReservation(w http.ResponseWriter, r *http.Request, poolID
 		return
 	}
 	p.reservations[in.RequestID] = reservation{requestID: in.RequestID, bytes: in.Bytes}
+	s.recordEvent(actionReservationCreated,
+		storagePoolPath+"/"+poolID+"/reservations/"+in.RequestID, poolID, in.Bytes)
 	writeJSON(w, http.StatusCreated, reservationView{PoolID: poolID, RequestID: in.RequestID, Bytes: in.Bytes})
 }
 
@@ -289,6 +299,10 @@ func (s *store) deleteReservation(w http.ResponseWriter, poolID, requestID strin
 		return
 	}
 	// Deleting an unknown or already-deleted reservation is a success.
-	delete(p.reservations, requestID)
+	if res, existed := p.reservations[requestID]; existed {
+		delete(p.reservations, requestID)
+		s.recordEvent(actionReservationDeleted,
+			storagePoolPath+"/"+poolID+"/reservations/"+requestID, poolID, -res.bytes)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }

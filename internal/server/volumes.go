@@ -164,6 +164,7 @@ func (s *store) createVolume(w http.ResponseWriter, r *http.Request) {
 	v := &volume{id: in.ID, poolID: in.PoolID, sizeBytes: in.SizeBytes}
 	s.volumes[in.ID] = v
 	p.volumeBytes += in.SizeBytes
+	s.recordEvent(actionVolumeCreated, volumePath+"/"+in.ID, in.PoolID, in.SizeBytes)
 	writeJSON(w, http.StatusCreated, v.view())
 }
 
@@ -185,6 +186,7 @@ func (s *store) deleteVolume(w http.ResponseWriter, id string) {
 	}
 	s.pools[v.poolID].volumeBytes -= v.sizeBytes
 	delete(s.volumes, id)
+	s.recordEvent(actionVolumeDeleted, volumePath+"/"+id, v.poolID, -v.sizeBytes)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -215,6 +217,7 @@ func (s *store) putBinding(w http.ResponseWriter, r *http.Request, volumeID stri
 	case v.binding == "":
 		v.binding = in.NodeID
 		v.generation++
+		s.recordEvent(actionVolumeBound, volumePath+"/"+volumeID+"/binding", v.poolID, 0)
 	case v.binding != in.NodeID:
 		writeError(w, http.StatusConflict, "volume_already_bound")
 		return
@@ -249,6 +252,7 @@ func (s *store) deleteBinding(w http.ResponseWriter, r *http.Request, volumeID s
 	v.binding = ""
 	if wasBound {
 		v.generation++
+		s.recordEvent(actionVolumeUnbound, volumePath+"/"+volumeID+"/binding", v.poolID, 0)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

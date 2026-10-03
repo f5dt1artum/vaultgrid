@@ -193,6 +193,7 @@ func (s *store) createBucket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.buckets[in.ID] = &bucket{id: in.ID, poolID: in.PoolID, objects: make(map[string]*object)}
+	s.recordEvent(actionBucketCreated, bucketPath+"/"+in.ID, in.PoolID, 0)
 	writeJSON(w, http.StatusCreated, s.buckets[in.ID].view())
 }
 
@@ -213,6 +214,7 @@ func (s *store) deleteBucket(w http.ResponseWriter, id string) {
 		return
 	}
 	delete(s.buckets, id)
+	s.recordEvent(actionBucketDeleted, bucketPath+"/"+id, b.poolID, 0)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -363,6 +365,13 @@ func (s *store) putObject(w http.ResponseWriter, r *http.Request, bucketID, key 
 	}
 	b.objects[key] = &object{key: key, content: content, metadata: metadata, etag: etag, sizeBytes: size}
 	p.objectBytes += size - oldSize
+	action := actionObjectCreated
+	if existing != nil {
+		action = actionObjectOverwritten
+	}
+	// An overwrite is recorded even when the size (and hence bytesDelta) is
+	// unchanged.
+	s.recordEvent(action, r.URL.Path, b.poolID, size-oldSize)
 	status := http.StatusCreated
 	if existing != nil {
 		status = http.StatusOK
@@ -428,6 +437,7 @@ func (s *store) deleteObject(w http.ResponseWriter, r *http.Request, bucketID, k
 	if o, exists := b.objects[key]; exists {
 		s.pools[b.poolID].objectBytes -= o.sizeBytes
 		delete(b.objects, key)
+		s.recordEvent(actionObjectDeleted, r.URL.Path, b.poolID, -o.sizeBytes)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

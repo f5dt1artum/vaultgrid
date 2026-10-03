@@ -56,6 +56,7 @@ const (
 	snapshotPath       = "/v1/snapshots"
 	bucketPath         = "/v1/buckets"
 	capacityReportPath = "/v1/capacity-report"
+	auditEventsPath    = "/v1/audit-events"
 )
 
 // route dispatches every non-healthz request. Paths it does not recognise
@@ -78,6 +79,8 @@ func (s *store) route(w http.ResponseWriter, r *http.Request) {
 		s.capacityReport(w, r)
 	case strings.HasPrefix(r.URL.Path, capacityReportPath+"/"):
 		writeError(w, http.StatusNotFound, "not_found")
+	case r.URL.Path == auditEventsPath || strings.HasPrefix(r.URL.Path, auditEventsPath+"/"):
+		s.routeAuditEvents(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "not_found")
 	}

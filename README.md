@@ -265,6 +265,40 @@ poolId,rawCapacityBytes,reservationBytes,volumeBytes,snapshotBytes,objectBytes,a
 
 `poolId` 不符合 id 规则、`format` 不是 `json` 或 `csv`、参数重复、出现未知参数或参数无值时返回 `400 invalid_request`；合法但不存在的 `poolId` 返回 `404 pool_not_found`。该路径仅允许 `GET`，其他方法返回 `405 method_not_allowed` 且带 `Allow: GET`；额外子路径返回 `404 not_found`。报表只读内存、无副作用，重启后遵循现有清空语义。
 
+## 审计事件
+
+每次成功且改变了业务状态的请求都会在内存中追加一条审计事件，可通过 `GET /v1/audit-events` 查询。事件仅保存在内存中，进程重启后清空；事件与业务状态、容量在同一临界区内原子提交，请求成功返回后即可查到，失败请求不遗留事件。
+
+事件字段：
+
+```json
+{"sequence":1,"action":"pool.created","resource":"/v1/storage-pools/pool-a","poolId":"pool-a","bytesDelta":0}
+```
+
+- `sequence`：从 1 开始的全局递增序号，按并发请求的状态提交顺序编号，连续不重复。
+- `action`：`pool.created`、`pool.deleted`、`reservation.created`、`reservation.deleted`、`volume.created`、`volume.deleted`、`volume.bound`、`volume.unbound`、`snapshot.created`、`snapshot.deleted`、`clone.created`、`bucket.created`、`bucket.deleted`、`object.created`、`object.overwritten`、`object.deleted`。
+- `resource`：被改变资源的公开路径（对象含完整 key 路径）；克隆卷是普通卷，其资源路径为 `/v1/volumes/{id}`。
+- `poolId`：资源所属池。
+- `bytesDelta`：该次变更引起的池 `allocatedBytes` 有符号变化；不改变容量的事件（建/删池、绑定/解绑、空桶）为 `0`。对象覆盖即使容量差为 `0` 也记录 `object.overwritten`。
+
+失败请求、只读请求以及成功但未改变状态的幂等重试/空操作（如同节点同版本重复绑定、对未绑定卷解绑、重复删除预留或对象）不记录事件。
+
+查询参数（均可选）：
+
+- `after`：非负十进制整数，缺省 `0`；只返回序号严格大于 `after` 的事件。
+- `limit`：`1` 至 `1000` 的十进制整数，缺省 `100`。
+- `poolId`：沿用既有 id 规则，缺省不过滤；只返回属于该池的事件。
+
+响应：
+
+```json
+{"items":[...],"nextAfter":0,"hasMore":false}
+```
+
+`items` 按 `sequence` 升序，至多 `limit` 条；`nextAfter` 取本页末项序号，空页取 `after`；`hasMore` 表示在同一读取状态下仍有匹配的后续事件。`after` 超过最大序号返回空页。整页（含 `hasMore`）来自一致状态，并发变更不会导致页内序号跳跃或重复。
+
+`after`/`limit` 非法、参数重复、出现未知参数、参数无值或 `poolId` 不符合 id 规则时返回 `400 invalid_request`；`poolId` 合法但池不存在返回 `404 pool_not_found`。该路径仅允许 `GET`，其他方法返回 `405 method_not_allowed` 且带 `Allow: GET`；额外子路径返回 `404 not_found`。
+
 ## 错误与路由
 
 错误响应统一为：
