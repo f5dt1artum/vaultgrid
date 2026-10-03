@@ -84,6 +84,12 @@ func (s *store) routeVolumes(w http.ResponseWriter, r *http.Request) {
 		default:
 			methodNotAllowed(w, http.MethodPut, http.MethodDelete)
 		}
+	case len(parts) == 2 && parts[1] == "size":
+		if r.Method != http.MethodPut {
+			methodNotAllowed(w, http.MethodPut)
+			return
+		}
+		s.putVolumeSize(w, r, parts[0])
 	case len(parts) == 2 && parts[1] == "snapshots":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
@@ -195,6 +201,77 @@ func (s *store) deleteVolume(w http.ResponseWriter, id string) {
 	delete(s.volumes, id)
 	s.appendAudit(auditVolumeDeleted, volumePath+"/"+id, v.poolID, -v.sizeBytes)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+type volumeSizeInput struct {
+	SizeBytes          int64  `json:"sizeBytes"`
+	ExpectedGeneration *int64 `json:"expectedGeneration"`
+}
+
+// putVolumeSize handles PUT /v1/volumes/{id}/size. It resizes an unbound
+// volume under an optimistic-generation guard: only a request naming the
+// volume's current generation can commit, and concurrent requests naming the
+// same generation are serialised by the store lock, so at most one changes
+// the size. A bound volume is refused before the generation is consulted.
+// Growing checks tenant quota first and pool capacity second; shrinking is
+// subject to neither. The size, generation, pool counters, tenant usage and
+// the volume.resized audit event commit in one critical section.
+func (s *store) putVolumeSize(w http.ResponseWriter, r *http.Request, volumeID string) {
+	var in volumeSizeInput
+	if !decodeRequest(r, &in) {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	// The sub-resource accepts no query string at all.
+	if r.URL.RawQuery != "" || !validID(volumeID) ||
+		in.ExpectedGeneration == nil || *in.ExpectedGeneration < 0 || in.SizeBytes <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	expected := *in.ExpectedGeneration
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.volumes[volumeID]
+	if !ok {
+		writeError(w, http.StatusNotFound, "volume_not_found")
+		return
+	}
+	// A bound volume cannot be resized; this wins over the generation check.
+	if v.binding != "" {
+		writeError(w, http.StatusConflict, "volume_in_use")
+		return
+	}
+	if v.generation != expected {
+		writeError(w, http.StatusConflict, "stale_generation")
+		return
+	}
+	// Same size at the matching generation is an idempotent no-op: no
+	// generation bump, no metering change and no audit event.
+	if v.sizeBytes == in.SizeBytes {
+		writeJSON(w, http.StatusOK, v.view())
+		return
+	}
+	p := s.pools[v.poolID]
+	delta := in.SizeBytes - v.sizeBytes
+	if delta > 0 {
+		if p.tenantQuotaExceeded(v.tenant, delta) {
+			writeError(w, http.StatusConflict, "tenant_quota_exceeded")
+			return
+		}
+		// allocated() still includes the volume's current size, so capacity
+		// is tested against the signed delta, not the target total.
+		if p.allocated() > p.rawCapacity-delta {
+			writeError(w, http.StatusConflict, "insufficient_capacity")
+			return
+		}
+	}
+	v.sizeBytes = in.SizeBytes
+	p.volumeBytes += delta
+	p.tenantUsed[v.tenant] += delta
+	v.generation++
+	s.appendAudit(auditVolumeResized, volumePath+"/"+volumeID+"/size", v.poolID, delta)
+	writeJSON(w, http.StatusOK, v.view())
 }
 
 func (s *store) putBinding(w http.ResponseWriter, r *http.Request, volumeID string) {
