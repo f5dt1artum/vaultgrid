@@ -59,6 +59,8 @@ type pool struct {
 	reservations  map[string]reservation
 	volumeBytes   int64 // total sizeBytes of volumes in this pool
 	snapshotBytes int64 // total sizeBytes of snapshots held in this pool
+	objectBytes   int64 // total sizeBytes of objects held in this pool's buckets
+	bucketCount   int   // buckets (even empty ones) keep the pool non-deletable
 }
 
 // volume is a capacity allocation inside a pool with an optional exclusive
@@ -75,7 +77,7 @@ type volume struct {
 }
 
 func (p *pool) allocated() int64 {
-	var total int64 = p.volumeBytes + p.snapshotBytes
+	var total int64 = p.volumeBytes + p.snapshotBytes + p.objectBytes
 	for _, r := range p.reservations {
 		total += r.bytes
 	}
@@ -103,6 +105,7 @@ type store struct {
 	pools       map[string]*pool
 	volumes     map[string]*volume
 	snapshots   map[string]*snapshot
+	buckets     map[string]*bucket
 	deviceOwner map[string]string
 }
 
@@ -111,6 +114,7 @@ func newStore() *store {
 		pools:       make(map[string]*pool),
 		volumes:     make(map[string]*volume),
 		snapshots:   make(map[string]*snapshot),
+		buckets:     make(map[string]*bucket),
 		deviceOwner: make(map[string]string),
 	}
 }
@@ -219,7 +223,7 @@ func (s *store) deletePool(w http.ResponseWriter, id string) {
 		writeError(w, http.StatusNotFound, "pool_not_found")
 		return
 	}
-	if len(p.reservations) > 0 || p.volumeBytes > 0 || p.snapshotBytes > 0 {
+	if len(p.reservations) > 0 || p.volumeBytes > 0 || p.snapshotBytes > 0 || p.bucketCount > 0 {
 		writeError(w, http.StatusConflict, "pool_not_empty")
 		return
 	}
