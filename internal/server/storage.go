@@ -50,8 +50,12 @@ type reservationView struct {
 type reservation struct {
 	requestID string
 	bytes     int64
+	tenant    string
 }
 
+// pool is one storage pool. tenantUsed tracks each tenant's charged bytes
+// (reservations + volumes + snapshots + objects) inside the pool; quotas maps
+// a tenant id to its byte limit. Tenants without a quota entry are unlimited.
 type pool struct {
 	id            string
 	devices       []deviceInput
@@ -60,12 +64,16 @@ type pool struct {
 	volumeBytes   int64 // total sizeBytes of volumes in this pool
 	snapshotBytes int64 // total sizeBytes of snapshots held in this pool
 	objectBytes   int64 // total sizeBytes of objects in buckets of this pool
+	tenantUsed    map[string]int64
+	quotas        map[string]int64
 }
 
 // volume is a capacity allocation inside a pool with an optional exclusive
 // node binding. generation is bumped on every binding state change.
 // cloneSource records the snapshot a volume was cloned from ("" for a volume
 // created directly) so clone retries can be told apart from foreign ids.
+// tenant is the owning tenant; its sizeBytes is charged to the tenant's usage
+// in the pool.
 type volume struct {
 	id          string
 	poolID      string
@@ -73,6 +81,7 @@ type volume struct {
 	generation  int64
 	binding     string // "" when unbound
 	cloneSource string // snapshot id when produced via a clone
+	tenant      string
 }
 
 func (p *pool) allocated() int64 {
@@ -207,6 +216,8 @@ func (s *store) createPool(w http.ResponseWriter, r *http.Request) {
 		devices:      devices,
 		rawCapacity:  rawCapacity,
 		reservations: make(map[string]reservation),
+		tenantUsed:   make(map[string]int64),
+		quotas:       make(map[string]int64),
 	}
 	s.pools[in.ID] = p
 	for _, d := range devices {
@@ -254,7 +265,8 @@ func (s *store) createReservation(w http.ResponseWriter, r *http.Request, poolID
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	if !validID(poolID) || !validID(in.RequestID) || in.Bytes <= 0 {
+	tenant, tok := extractTenant(r.Header)
+	if !tok || !validID(poolID) || !validID(in.RequestID) || in.Bytes <= 0 {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
@@ -267,11 +279,17 @@ func (s *store) createReservation(w http.ResponseWriter, r *http.Request, poolID
 		return
 	}
 	if existing, dup := p.reservations[in.RequestID]; dup {
-		if existing.bytes != in.Bytes {
+		if existing.bytes != in.Bytes || existing.tenant != tenant {
 			writeError(w, http.StatusConflict, "idempotency_conflict")
 			return
 		}
 		writeJSON(w, http.StatusOK, reservationView{PoolID: poolID, RequestID: existing.requestID, Bytes: existing.bytes})
+		return
+	}
+	// Holding the store lock makes the quota and capacity checks plus the
+	// charge atomic, so concurrent creates can never exceed either limit.
+	if p.tenantQuotaExceeded(tenant, in.Bytes) {
+		writeError(w, http.StatusConflict, "tenant_quota_exceeded")
 		return
 	}
 	allocated := p.allocated()
@@ -279,7 +297,8 @@ func (s *store) createReservation(w http.ResponseWriter, r *http.Request, poolID
 		writeError(w, http.StatusConflict, "insufficient_capacity")
 		return
 	}
-	p.reservations[in.RequestID] = reservation{requestID: in.RequestID, bytes: in.Bytes}
+	p.reservations[in.RequestID] = reservation{requestID: in.RequestID, bytes: in.Bytes, tenant: tenant}
+	p.tenantUsed[tenant] += in.Bytes
 	s.appendAudit(auditReservationCreated,
 		storagePoolPath+"/"+poolID+"/reservations/"+in.RequestID, poolID, in.Bytes)
 	writeJSON(w, http.StatusCreated, reservationView{PoolID: poolID, RequestID: in.RequestID, Bytes: in.Bytes})
@@ -301,6 +320,7 @@ func (s *store) deleteReservation(w http.ResponseWriter, poolID, requestID strin
 	// no state change, so only a real deletion records an event.
 	if r, existed := p.reservations[requestID]; existed {
 		delete(p.reservations, requestID)
+		p.tenantUsed[r.tenant] -= r.bytes
 		s.appendAudit(auditReservationDeleted,
 			storagePoolPath+"/"+poolID+"/reservations/"+requestID, poolID, -r.bytes)
 	}

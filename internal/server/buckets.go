@@ -41,10 +41,12 @@ type objectView struct {
 
 // bucket is a namespace of objects bound to one pool. bytesUsed is kept in
 // sync with the sum of its objects' sizes; the same total is charged to the
-// pool as objectBytes.
+// pool as objectBytes. tenant owns the bucket; object bytes are charged to
+// the tenant's usage in the pool.
 type bucket struct {
 	id      string
 	poolID  string
+	tenant  string
 	objects map[string]*object
 }
 
@@ -173,7 +175,8 @@ func (s *store) createBucket(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	if !validID(in.ID) || !validID(in.PoolID) {
+	tenant, tok := extractTenant(r.Header)
+	if !tok || !validID(in.ID) || !validID(in.PoolID) {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
@@ -181,7 +184,7 @@ func (s *store) createBucket(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existing, dup := s.buckets[in.ID]; dup {
-		if existing.poolID == in.PoolID {
+		if existing.poolID == in.PoolID && existing.tenant == tenant {
 			writeJSON(w, http.StatusOK, existing.view())
 			return
 		}
@@ -192,7 +195,7 @@ func (s *store) createBucket(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "pool_not_found")
 		return
 	}
-	s.buckets[in.ID] = &bucket{id: in.ID, poolID: in.PoolID, objects: make(map[string]*object)}
+	s.buckets[in.ID] = &bucket{id: in.ID, poolID: in.PoolID, tenant: tenant, objects: make(map[string]*object)}
 	s.appendAudit(auditBucketCreated, bucketPath+"/"+in.ID, in.PoolID, 0)
 	writeJSON(w, http.StatusCreated, s.buckets[in.ID].view())
 }
@@ -356,15 +359,21 @@ func (s *store) putObject(w http.ResponseWriter, r *http.Request, bucketID, key 
 		oldSize = existing.sizeBytes
 	}
 	p := s.pools[b.poolID]
-	// The store lock makes the capacity check and the charge atomic, so
-	// concurrent writes can never overcommit the pool, and a failed write
-	// leaves the old object and its metadata untouched.
+	// The store lock makes the quota and capacity checks plus the charge
+	// atomic, so concurrent writes can never exceed either limit, and a failed
+	// write leaves the old object and its metadata untouched. Objects inherit
+	// the bucket's tenant; only a growing write can breach the quota.
+	if delta := size - oldSize; delta > 0 && p.tenantQuotaExceeded(b.tenant, delta) {
+		writeError(w, http.StatusConflict, "tenant_quota_exceeded")
+		return
+	}
 	if p.allocated() > p.rawCapacity-(size-oldSize) {
 		writeError(w, http.StatusConflict, "insufficient_capacity")
 		return
 	}
 	b.objects[key] = &object{key: key, content: content, metadata: metadata, etag: etag, sizeBytes: size}
 	p.objectBytes += size - oldSize
+	p.tenantUsed[b.tenant] += size - oldSize
 	// An overwrite is recorded even when the size delta is zero.
 	resource := bucketPath + "/" + bucketID + "/objects/" + key
 	if existing != nil {
@@ -437,6 +446,7 @@ func (s *store) deleteObject(w http.ResponseWriter, r *http.Request, bucketID, k
 	// state change, so only a real deletion records an event.
 	if o, exists := b.objects[key]; exists {
 		s.pools[b.poolID].objectBytes -= o.sizeBytes
+		s.pools[b.poolID].tenantUsed[b.tenant] -= o.sizeBytes
 		delete(b.objects, key)
 		s.appendAudit(auditObjectDeleted, bucketPath+"/"+bucketID+"/objects/"+key, b.poolID, -o.sizeBytes)
 	}

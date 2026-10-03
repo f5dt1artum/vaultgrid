@@ -131,6 +131,23 @@ func (s *store) routeStoragePools(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.deleteReservation(w, parts[0], parts[2])
+	case len(parts) == 2 && parts[1] == "tenant-quotas":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		s.listTenantQuotas(w, parts[0])
+	case len(parts) == 3 && parts[1] == "tenant-quotas":
+		switch r.Method {
+		case http.MethodGet:
+			s.getTenantQuota(w, parts[0], parts[2])
+		case http.MethodPut:
+			s.putTenantQuota(w, r, parts[0], parts[2])
+		case http.MethodDelete:
+			s.deleteTenantQuota(w, parts[0], parts[2])
+		default:
+			methodNotAllowed(w, http.MethodGet, http.MethodPut, http.MethodDelete)
+		}
 	default:
 		writeError(w, http.StatusNotFound, "not_found")
 	}

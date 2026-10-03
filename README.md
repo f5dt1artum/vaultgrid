@@ -240,6 +240,38 @@ go run ./cmd/vaultgrid
 
 非法 key、元数据、查询参数、未知字段或格式错误返回 `400 invalid_request`。并发写删不会超配、重扣或残留部分状态。
 
+## 租户配额
+
+每个池可按租户设置字节配额。创建预留、卷、桶时可携带至多一个 `X-Vaultgrid-Tenant` 头指定归属租户（沿用 id 规则）；缺省归属 `default`，非法值或重复头返回 `400 invalid_request`。快照继承源卷的租户，克隆继承快照的租户并计入目标池，对象继承所属桶的租户；删除资源或缩小对象即释放原租户用量。未配置配额的租户不限额。租户的 `usedBytes` 是其在池内的预留、卷、快照与对象字节总和（空桶不计量）。
+
+### 设置配额（幂等）
+
+`PUT /v1/storage-pools/{poolId}/tenant-quotas/{tenantId}`
+
+```json
+{"limitBytes": 600}
+```
+
+`limitBytes` 为正 JSON 整数。成功返回：
+
+```json
+{"poolId":"pool-a","tenantId":"team-a","limitBytes":600,"usedBytes":0,"availableBytes":600}
+```
+
+- 首次创建返回 `201`；修改限额或同值重放返回 `200`（同值重放不改变状态）。
+- 限额低于该租户当前用量返回 `409 quota_below_usage`。
+- 池不存在返回 `404 pool_not_found`；非法 id 或正文返回 `400 invalid_request`。
+
+### 查询、列出与删除
+
+- `GET /v1/storage-pools/{poolId}/tenant-quotas` 返回 `{"items":[...]}`，按 tenantId 升序。
+- `GET /v1/storage-pools/{poolId}/tenant-quotas/{tenantId}` 返回单个配额；配额不存在返回 `404 quota_not_found`。
+- `DELETE /v1/storage-pools/{poolId}/tenant-quotas/{tenantId}` 始终返回 `204`（含从未存在的配额），只解除限制；配额不阻止删除空池。
+
+### 配额执行
+
+容量增加（建预留、建卷、建快照、克隆、写对象）先判定幂等，再在同一临界区内原子检查租户额度与池容量：超出租户配额返回 `409 tenant_quota_exceeded`，池容量不足仍返回 `409 insufficient_capacity`；失败不留资源、计量或审计残留，并发不会突破任一上限。同标识同租户的重试保留原幂等结果；租户不同则按既有规则返回 `idempotency_conflict`、`volume_exists` 或 `bucket_exists`。旧客户端不传头时一切行为不变（归属 `default`）。
+
 ## 容量报表
 
 `GET /v1/capacity-report` 导出池级容量报表，只接受两个可选查询参数：
@@ -276,10 +308,10 @@ poolId,rawCapacityBytes,reservationBytes,volumeBytes,snapshotBytes,objectBytes,a
 ```
 
 - `sequence` 从 1 起连续递增；并发请求按实际提交状态的先后编号。
-- `action` 取值：`pool.created`、`pool.deleted`、`reservation.created`、`reservation.deleted`、`volume.created`、`volume.deleted`、`volume.bound`、`volume.unbound`、`snapshot.created`、`snapshot.deleted`、`clone.created`、`bucket.created`、`bucket.deleted`、`object.created`、`object.overwritten`、`object.deleted`。
-- `resource` 是事件对应资源的公开路径（预留为 `/v1/storage-pools/{id}/reservations/{requestId}`，绑定为 `/v1/volumes/{id}/binding`，对象为 `/v1/buckets/{id}/objects/{key}`，克隆卷为 `/v1/volumes/{id}`）。
-- `poolId` 是事件所属池：卷、快照、桶、预留、对象归属其所在池；克隆计入目标池。
-- `bytesDelta` 是该次提交对池 `allocatedBytes` 的有符号变化：创建为正、删除为负、容量无关的动作（建删池、建删桶、绑定解绑）为 `0`。对象覆盖为 `新大小-旧大小`；**即使容量差为零也记录 `object.overwritten`**。
+- `action` 取值：`pool.created`、`pool.deleted`、`reservation.created`、`reservation.deleted`、`volume.created`、`volume.deleted`、`volume.bound`、`volume.unbound`、`snapshot.created`、`snapshot.deleted`、`clone.created`、`bucket.created`、`bucket.deleted`、`object.created`、`object.overwritten`、`object.deleted`、`tenant-quota.created`、`tenant-quota.updated`、`tenant-quota.deleted`。
+- `resource` 是事件对应资源的公开路径（预留为 `/v1/storage-pools/{id}/reservations/{requestId}`，绑定为 `/v1/volumes/{id}/binding`，对象为 `/v1/buckets/{id}/objects/{key}`，克隆卷为 `/v1/volumes/{id}`，租户配额为 `/v1/storage-pools/{id}/tenant-quotas/{tenantId}`）。
+- `poolId` 是事件所属池：卷、快照、桶、预留、对象、租户配额归属其所在池；克隆计入目标池。
+- `bytesDelta` 是该次提交对池 `allocatedBytes` 的有符号变化：创建为正、删除为负、容量无关的动作（建删池、建删桶、绑定解绑、租户配额增删改）为 `0`。对象覆盖为 `新大小-旧大小`；**即使容量差为零也记录 `object.overwritten`**。
 
 ### 查询事件
 
@@ -315,6 +347,7 @@ poolId,rawCapacityBytes,reservationBytes,volumeBytes,snapshotBytes,objectBytes,a
 | 404 | `snapshot_not_found` | 查询、删除不存在的快照，或基于不存在的快照克隆 |
 | 404 | `bucket_not_found` | 查询、删除不存在的桶，或向不存在的桶读写对象 |
 | 404 | `object_not_found` | 读取不存在的对象 |
+| 404 | `quota_not_found` | 查询不存在的租户配额 |
 | 404 | `not_found` | 未知路径 |
 | 405 | `method_not_allowed` | 不支持的方法，响应带正确的 `Allow` 头 |
 | 409 | `pool_exists` | 池 id 已存在 |
@@ -329,6 +362,8 @@ poolId,rawCapacityBytes,reservationBytes,volumeBytes,snapshotBytes,objectBytes,a
 | 409 | `snapshot_exists` | 同快照 id 重试但源卷或源版本不同 |
 | 409 | `bucket_exists` | 同桶 id 重试但 poolId 不同 |
 | 409 | `bucket_not_empty` | 删除仍有对象的桶 |
+| 409 | `quota_below_usage` | 租户配额限额低于该租户当前用量 |
+| 409 | `tenant_quota_exceeded` | 容量增加超出该租户在池内的配额 |
 | 412 | `precondition_failed` | 条件写入的 If-Match / If-None-Match 不满足 |
 
 ## 验证

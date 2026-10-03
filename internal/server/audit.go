@@ -30,6 +30,9 @@ const (
 	auditObjectCreated      auditAction = "object.created"
 	auditObjectOverwritten  auditAction = "object.overwritten"
 	auditObjectDeleted      auditAction = "object.deleted"
+	auditTenantQuotaCreated auditAction = "tenant-quota.created"
+	auditTenantQuotaUpdated auditAction = "tenant-quota.updated"
+	auditTenantQuotaDeleted auditAction = "tenant-quota.deleted"
 )
 
 // auditEventView is the public representation of an audit event.

@@ -135,7 +135,8 @@ func (s *store) createVolume(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	if !validID(in.ID) || !validID(in.PoolID) || in.SizeBytes <= 0 {
+	tenant, tok := extractTenant(r.Header)
+	if !tok || !validID(in.ID) || !validID(in.PoolID) || in.SizeBytes <= 0 {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
@@ -143,7 +144,7 @@ func (s *store) createVolume(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existing, dup := s.volumes[in.ID]; dup {
-		if existing.poolID == in.PoolID && existing.sizeBytes == in.SizeBytes {
+		if existing.poolID == in.PoolID && existing.sizeBytes == in.SizeBytes && existing.tenant == tenant {
 			writeJSON(w, http.StatusOK, existing.view())
 			return
 		}
@@ -155,15 +156,20 @@ func (s *store) createVolume(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "pool_not_found")
 		return
 	}
-	// Holding the store lock makes the capacity check and the reservation
-	// atomic, so concurrent creates can never overcommit the pool.
+	// Holding the store lock makes the quota and capacity checks plus the
+	// charge atomic, so concurrent creates can never exceed either limit.
+	if p.tenantQuotaExceeded(tenant, in.SizeBytes) {
+		writeError(w, http.StatusConflict, "tenant_quota_exceeded")
+		return
+	}
 	if p.allocated() > p.rawCapacity-in.SizeBytes {
 		writeError(w, http.StatusConflict, "insufficient_capacity")
 		return
 	}
-	v := &volume{id: in.ID, poolID: in.PoolID, sizeBytes: in.SizeBytes}
+	v := &volume{id: in.ID, poolID: in.PoolID, sizeBytes: in.SizeBytes, tenant: tenant}
 	s.volumes[in.ID] = v
 	p.volumeBytes += in.SizeBytes
+	p.tenantUsed[tenant] += in.SizeBytes
 	s.appendAudit(auditVolumeCreated, volumePath+"/"+in.ID, in.PoolID, in.SizeBytes)
 	writeJSON(w, http.StatusCreated, v.view())
 }
@@ -185,6 +191,7 @@ func (s *store) deleteVolume(w http.ResponseWriter, id string) {
 		return
 	}
 	s.pools[v.poolID].volumeBytes -= v.sizeBytes
+	s.pools[v.poolID].tenantUsed[v.tenant] -= v.sizeBytes
 	delete(s.volumes, id)
 	s.appendAudit(auditVolumeDeleted, volumePath+"/"+id, v.poolID, -v.sizeBytes)
 	w.WriteHeader(http.StatusNoContent)
