@@ -263,6 +263,21 @@ go run ./cmd/vaultgrid
 
 非法 key、元数据、查询参数、未知字段或格式错误返回 `400 invalid_request`。并发写删不会超配、重扣或残留部分状态。
 
+### 按桶版本控制
+
+`GET /v1/buckets/{bucketId}/versioning` 返回 `{"enabled": false|true}`；`PUT` 仅接受 `{"enabled":true}`，启用幂等且不可撤销：重复启用返回 `200` 且只有首次记录 `bucket.versioning-enabled`。其他正文返回 `400 invalid_request`，桶不存在返回 `404 bucket_not_found`。未启用的桶保持上述原行为（覆盖即替换、删除即永久、无任何版本标识）。
+
+启用后：
+
+- `PUT` 不再替换旧内容，而是生成一个唯一非空的 `versionId`，经 `X-Vaultgrid-Version-Id` 响应头和正文 `versionId` 字段返回；每个数据版本都按大小计入池容量与租户配额；条件写入只判断当前可见版本（最新一代为删除标记时视为不存在）。
+- `GET`/`HEAD` 默认取最新一代；最新为删除标记时返回 `404 object_not_found`。带 `?versionId=<id>` 时返回对应数据版本及版本头；版本不存在或指向删除标记返回 `404 object_version_not_found`。`versionId` 为空、重复或与其他参数并用返回 `400 invalid_request`。
+- `DELETE` 不带 `versionId` 时新增一个删除标记（最新已是标记则只返回 `204`，不再新增）；带 `versionId` 时永久删除该代，仅数据版本释放容量，版本不存在返回 `404 object_version_not_found`。
+- `GET /v1/buckets/{bucketId}/object-versions` 只接受一个 `prefix` 参数，返回 `{"items":[...]}`：匹配 key 的全部数据版本与删除标记，按 key 升序、同 key 从新到旧，字段为 `key`、`versionId`、`isLatest`、`deleteMarker`、`sizeBytes`、`etag`、`metadata`。普通对象列表仍只显示当前可见对象。
+- 桶的 `objectCount` 只计可见 key；`bytesUsed`、池 `objectBytes` 与租户 `usedBytes` 统计全部数据版本。只要仍存在版本或删除标记，删桶返回 `409 bucket_not_empty`。
+- 启用前已存在的对象在启用时获得版本 id，成为可寻址的数据版本。
+
+版本相关的状态变更分别记录审计事件 `bucket.versioning-enabled`、`object.version-created`、`object.delete-marker-created`、`object.version-deleted`；失败、条件不满足与无操作重试不留任何状态、计量或审计残留，并发写删产生可串行化的提交顺序。
+
 ## 租户配额
 
 每个池可按租户设置字节配额。创建预留、卷、桶时可携带至多一个 `X-Vaultgrid-Tenant` 头指定归属租户（沿用 id 规则）；缺省归属 `default`，非法值或重复头返回 `400 invalid_request`。快照继承源卷的租户，克隆继承快照的租户并计入目标池，对象继承所属桶的租户；删除资源或缩小对象即释放原租户用量。未配置配额的租户不限额。租户的 `usedBytes` 是其在池内的预留、卷、快照与对象字节总和（空桶不计量）。
@@ -331,8 +346,8 @@ poolId,rawCapacityBytes,reservationBytes,volumeBytes,snapshotBytes,objectBytes,a
 ```
 
 - `sequence` 从 1 起连续递增；并发请求按实际提交状态的先后编号。
-- `action` 取值：`pool.created`、`pool.deleted`、`reservation.created`、`reservation.deleted`、`volume.created`、`volume.deleted`、`volume.bound`、`volume.unbound`、`volume.resized`、`snapshot.created`、`snapshot.deleted`、`clone.created`、`bucket.created`、`bucket.deleted`、`object.created`、`object.overwritten`、`object.deleted`、`tenant-quota.created`、`tenant-quota.updated`、`tenant-quota.deleted`。
-- `resource` 是事件对应资源的公开路径（预留为 `/v1/storage-pools/{id}/reservations/{requestId}`，绑定为 `/v1/volumes/{id}/binding`，卷大小调整为 `/v1/volumes/{id}/size`，对象为 `/v1/buckets/{id}/objects/{key}`，克隆卷为 `/v1/volumes/{id}`，租户配额为 `/v1/storage-pools/{id}/tenant-quotas/{tenantId}`）。
+- `action` 取值：`pool.created`、`pool.deleted`、`reservation.created`、`reservation.deleted`、`volume.created`、`volume.deleted`、`volume.bound`、`volume.unbound`、`volume.resized`、`snapshot.created`、`snapshot.deleted`、`clone.created`、`bucket.created`、`bucket.deleted`、`bucket.versioning-enabled`、`object.created`、`object.overwritten`、`object.deleted`、`object.version-created`、`object.delete-marker-created`、`object.version-deleted`、`tenant-quota.created`、`tenant-quota.updated`、`tenant-quota.deleted`。
+- `resource` 是事件对应资源的公开路径（预留为 `/v1/storage-pools/{id}/reservations/{requestId}`，绑定为 `/v1/volumes/{id}/binding`，卷大小调整为 `/v1/volumes/{id}/size`，对象为 `/v1/buckets/{id}/objects/{key}`，启用版本控制为 `/v1/buckets/{id}/versioning`，克隆卷为 `/v1/volumes/{id}`，租户配额为 `/v1/storage-pools/{id}/tenant-quotas/{tenantId}`）。
 - `poolId` 是事件所属池：卷、快照、桶、预留、对象、租户配额归属其所在池；克隆计入目标池。
 - `bytesDelta` 是该次提交对池 `allocatedBytes` 的有符号变化：创建为正、删除为负、容量无关的动作（建删池、建删桶、绑定解绑、租户配额增删改）为 `0`。对象覆盖为 `新大小-旧大小`；**即使容量差为零也记录 `object.overwritten`**。卷调整为 `新大小-旧大小`，同大小请求不记录 `volume.resized`。
 
@@ -369,7 +384,8 @@ poolId,rawCapacityBytes,reservationBytes,volumeBytes,snapshotBytes,objectBytes,a
 | 404 | `volume_not_found` | 查询、绑定、解绑、删除或调整大小不存在的卷，或为不存在的卷创建快照 |
 | 404 | `snapshot_not_found` | 查询、删除不存在的快照，或基于不存在的快照克隆 |
 | 404 | `bucket_not_found` | 查询、删除不存在的桶，或向不存在的桶读写对象 |
-| 404 | `object_not_found` | 读取不存在的对象 |
+| 404 | `object_not_found` | 读取不存在的对象，或版本化桶中最新一代为删除标记 |
+| 404 | `object_version_not_found` | 按 versionId 读取或永久删除不存在（或指向删除标记）的版本 |
 | 404 | `quota_not_found` | 查询不存在的租户配额 |
 | 404 | `not_found` | 未知路径 |
 | 405 | `method_not_allowed` | 不支持的方法，响应带正确的 `Allow` 头 |
@@ -384,7 +400,7 @@ poolId,rawCapacityBytes,reservationBytes,volumeBytes,snapshotBytes,objectBytes,a
 | 409 | `stale_generation` | 绑定/解绑、创建快照或调整大小时 expectedGeneration 与当前版本不符 |
 | 409 | `snapshot_exists` | 同快照 id 重试但源卷或源版本不同 |
 | 409 | `bucket_exists` | 同桶 id 重试但 poolId 不同 |
-| 409 | `bucket_not_empty` | 删除仍有对象的桶 |
+| 409 | `bucket_not_empty` | 删除仍有对象（含版本或删除标记）的桶 |
 | 409 | `quota_below_usage` | 租户配额限额低于该租户当前用量 |
 | 409 | `tenant_quota_exceeded` | 容量增加（建预留、建卷、卷扩容、建快照、克隆、写对象）超出该租户在池内的配额（缩容不受限） |
 | 412 | `precondition_failed` | 条件写入的 If-Match / If-None-Match 不满足 |

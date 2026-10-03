@@ -17,6 +17,11 @@ import (
 // The constant is already in Go's canonical header form.
 const metaPrefix = "X-Vaultgrid-Meta-"
 
+// versionHeader carries the version id of an object generation on writes
+// into versioning-enabled buckets and on reads of a specific version. The
+// constant is already in Go's canonical header form.
+const versionHeader = "X-Vaultgrid-Version-Id"
+
 type createBucketInput struct {
 	ID     string `json:"id"`
 	PoolID string `json:"poolId"`
@@ -31,49 +36,98 @@ type bucketView struct {
 }
 
 // objectView is the public representation of an object after a write, and
-// the summary shape used in object listings.
+// the summary shape used in object listings. VersionID is only set on writes
+// into versioning-enabled buckets and is omitted everywhere else.
 type objectView struct {
 	Key       string            `json:"key"`
 	SizeBytes int64             `json:"sizeBytes"`
 	Metadata  map[string]string `json:"metadata"`
 	ETag      string            `json:"etag"`
+	VersionID string            `json:"versionId,omitempty"`
 }
 
-// bucket is a namespace of objects bound to one pool. bytesUsed is kept in
-// sync with the sum of its objects' sizes; the same total is charged to the
-// pool as objectBytes. tenant owns the bucket; object bytes are charged to
-// the tenant's usage in the pool.
+// objectVersionView is one entry of the object-versions listing: a data
+// version or a delete marker of one key.
+type objectVersionView struct {
+	Key          string            `json:"key"`
+	VersionID    string            `json:"versionId"`
+	IsLatest     bool              `json:"isLatest"`
+	DeleteMarker bool              `json:"deleteMarker"`
+	SizeBytes    int64             `json:"sizeBytes"`
+	ETag         string            `json:"etag"`
+	Metadata     map[string]string `json:"metadata"`
+}
+
+// versioningView is the request and response body of the bucket versioning
+// endpoint. Enabling is irreversible, so the only accepted input is
+// {"enabled":true}.
+type versioningView struct {
+	Enabled bool `json:"enabled"`
+}
+
+// bucket is a namespace of objects bound to one pool. objects maps each key
+// to its generations, newest first; a key whose generations are all gone is
+// removed from the map. In a bucket without versioning each key holds exactly
+// one data version with an empty versionID and deletes are permanent. Once
+// versioning is enabled (irreversibly) every generation carries a unique
+// non-empty versionID, writes add generations and deletes add delete markers.
+// tenant owns the bucket; the bytes of every data version are charged to the
+// tenant's usage in the pool.
 type bucket struct {
-	id      string
-	poolID  string
-	tenant  string
-	objects map[string]*object
+	id         string
+	poolID     string
+	tenant     string
+	versioning bool
+	objects    map[string][]*objectVersion
 }
 
+// bytesUsed sums every data version of every key; delete markers carry no
+// bytes. The same total is charged to the pool as objectBytes.
 func (b *bucket) bytesUsed() int64 {
 	var total int64
-	for _, o := range b.objects {
-		total += o.sizeBytes
+	for _, versions := range b.objects {
+		for _, v := range versions {
+			total += v.sizeBytes
+		}
 	}
 	return total
 }
 
+// visibleKeys counts the keys whose newest generation is a data version.
+func (b *bucket) visibleKeys() int {
+	n := 0
+	for _, versions := range b.objects {
+		if len(versions) > 0 && !versions[0].deleteMarker {
+			n++
+		}
+	}
+	return n
+}
+
 func (b *bucket) view() bucketView {
-	return bucketView{ID: b.id, PoolID: b.poolID, ObjectCount: len(b.objects), BytesUsed: b.bytesUsed()}
+	return bucketView{ID: b.id, PoolID: b.poolID, ObjectCount: b.visibleKeys(), BytesUsed: b.bytesUsed()}
 }
 
-// object is a stored byte sequence with user metadata. etag is the quoted
-// lowercase hex SHA-256 of content.
-type object struct {
-	key       string
-	content   []byte
-	metadata  map[string]string
-	etag      string
-	sizeBytes int64
+// visible returns the newest generation of key when it is a data version,
+// and nil when the key is unknown or its newest generation is a delete
+// marker. Conditional writes and plain reads judge only this generation.
+func (b *bucket) visible(key string) *objectVersion {
+	if versions := b.objects[key]; len(versions) > 0 && !versions[0].deleteMarker {
+		return versions[0]
+	}
+	return nil
 }
 
-func (o *object) view() objectView {
-	return objectView{Key: o.key, SizeBytes: o.sizeBytes, Metadata: o.metadata, ETag: o.etag}
+// objectVersion is one generation of an object key: either a data version
+// holding content, or a delete marker hiding every older generation. etag is
+// the quoted lowercase hex SHA-256 of content ("" on a delete marker).
+type objectVersion struct {
+	versionID    string
+	deleteMarker bool
+	content      []byte
+	metadata     map[string]string
+	etag         string
+	sizeBytes    int64
 }
 
 // routeBuckets dispatches /v1/buckets and its sub-paths. The object key is
@@ -107,6 +161,25 @@ func (s *store) routeBuckets(w http.ResponseWriter, r *http.Request) {
 		default:
 			methodNotAllowed(w, http.MethodGet, http.MethodDelete)
 		}
+		return
+	}
+	if tail == "versioning" {
+		switch r.Method {
+		case http.MethodGet:
+			s.getVersioning(w, bucketID)
+		case http.MethodPut:
+			s.putVersioning(w, r, bucketID)
+		default:
+			methodNotAllowed(w, http.MethodGet, http.MethodPut)
+		}
+		return
+	}
+	if tail == "object-versions" {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		s.listObjectVersions(w, r, bucketID)
 		return
 	}
 	if tail == "objects" {
@@ -195,7 +268,7 @@ func (s *store) createBucket(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "pool_not_found")
 		return
 	}
-	s.buckets[in.ID] = &bucket{id: in.ID, poolID: in.PoolID, tenant: tenant, objects: make(map[string]*object)}
+	s.buckets[in.ID] = &bucket{id: in.ID, poolID: in.PoolID, tenant: tenant, objects: make(map[string][]*objectVersion)}
 	s.appendAudit(auditBucketCreated, bucketPath+"/"+in.ID, in.PoolID, 0)
 	writeJSON(w, http.StatusCreated, s.buckets[in.ID].view())
 }
@@ -212,6 +285,8 @@ func (s *store) deleteBucket(w http.ResponseWriter, id string) {
 		writeError(w, http.StatusNotFound, "bucket_not_found")
 		return
 	}
+	// Any remaining generation — data version or delete marker — blocks
+	// bucket deletion, even when none of it is currently visible.
 	if len(b.objects) > 0 {
 		writeError(w, http.StatusConflict, "bucket_not_empty")
 		return
@@ -219,6 +294,63 @@ func (s *store) deleteBucket(w http.ResponseWriter, id string) {
 	delete(s.buckets, id)
 	s.appendAudit(auditBucketDeleted, bucketPath+"/"+id, b.poolID, 0)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// getVersioning handles GET /v1/buckets/{bucketId}/versioning.
+func (s *store) getVersioning(w http.ResponseWriter, bucketID string) {
+	if !validID(bucketID) {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	s.mu.RLock()
+	b, ok := s.buckets[bucketID]
+	enabled := false
+	if ok {
+		enabled = b.versioning
+	}
+	s.mu.RUnlock()
+	if !ok {
+		writeError(w, http.StatusNotFound, "bucket_not_found")
+		return
+	}
+	writeJSON(w, http.StatusOK, versioningView{Enabled: enabled})
+}
+
+// putVersioning handles PUT /v1/buckets/{bucketId}/versioning. Enabling is
+// idempotent and irreversible: every accepted request answers 200, but only
+// the transition itself records an audit event.
+func (s *store) putVersioning(w http.ResponseWriter, r *http.Request, bucketID string) {
+	var in versioningView
+	if !decodeRequest(r, &in) {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if !validID(bucketID) || !in.Enabled {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok := s.buckets[bucketID]
+	if !ok {
+		writeError(w, http.StatusNotFound, "bucket_not_found")
+		return
+	}
+	if !b.versioning {
+		b.versioning = true
+		// Objects written before versioning was enabled become addressable
+		// versions, so every generation in a versioned bucket has a unique
+		// non-empty id.
+		for _, versions := range b.objects {
+			for _, v := range versions {
+				if v.versionID == "" {
+					v.versionID = s.nextVersionID()
+				}
+			}
+		}
+		s.appendAudit(auditVersioningEnabled, bucketPath+"/"+bucketID+"/versioning", b.poolID, 0)
+	}
+	writeJSON(w, http.StatusOK, versioningView{Enabled: true})
 }
 
 // validObjectKey reports whether key is 1..1024 bytes of valid UTF-8 with no
@@ -311,6 +443,31 @@ func etagOf(content []byte) string {
 	return `"` + hex.EncodeToString(sum[:]) + `"`
 }
 
+// parseVersionQuery accepts an empty query or exactly one
+// "versionId=<non-empty>" pair. An empty or duplicated versionId, or any
+// other parameter alongside it, yields ok=false.
+func parseVersionQuery(raw string) (versionID string, present, ok bool) {
+	if raw == "" {
+		return "", false, true
+	}
+	for _, pair := range strings.Split(raw, "&") {
+		k, value, found := strings.Cut(pair, "=")
+		if !found {
+			return "", false, false
+		}
+		decodedKey, err := url.QueryUnescape(k)
+		if err != nil || decodedKey != "versionId" || present {
+			return "", false, false
+		}
+		decodedValue, err := url.QueryUnescape(value)
+		if err != nil || decodedValue == "" {
+			return "", false, false
+		}
+		versionID, present = decodedValue, true
+	}
+	return versionID, present, true
+}
+
 func (s *store) putObject(w http.ResponseWriter, r *http.Request, bucketID, key string) {
 	if !validID(bucketID) || !validObjectKey(key) {
 		writeError(w, http.StatusBadRequest, "invalid_request")
@@ -345,7 +502,9 @@ func (s *store) putObject(w http.ResponseWriter, r *http.Request, bucketID, key 
 		writeError(w, http.StatusNotFound, "bucket_not_found")
 		return
 	}
-	existing := b.objects[key]
+	// Conditional writes judge only the currently visible generation: a key
+	// whose newest generation is a delete marker counts as absent.
+	existing := b.visible(key)
 	if ifMatch != "" && (existing == nil || existing.etag != ifMatch) {
 		writeError(w, http.StatusPreconditionFailed, "precondition_failed")
 		return
@@ -354,15 +513,18 @@ func (s *store) putObject(w http.ResponseWriter, r *http.Request, bucketID, key 
 		writeError(w, http.StatusPreconditionFailed, "precondition_failed")
 		return
 	}
+	// A versioned write keeps every older generation, so it always charges
+	// the full new size; an unversioned overwrite releases the old
+	// generation and only charges the delta.
 	var oldSize int64
-	if existing != nil {
+	if existing != nil && !b.versioning {
 		oldSize = existing.sizeBytes
 	}
 	p := s.pools[b.poolID]
 	// The store lock makes the quota and capacity checks plus the charge
 	// atomic, so concurrent writes can never exceed either limit, and a failed
-	// write leaves the old object and its metadata untouched. Objects inherit
-	// the bucket's tenant; only a growing write can breach the quota.
+	// write leaves the old generations and their metadata untouched. Objects
+	// inherit the bucket's tenant; only a growing write can breach the quota.
 	if delta := size - oldSize; delta > 0 && p.tenantQuotaExceeded(b.tenant, delta) {
 		writeError(w, http.StatusConflict, "tenant_quota_exceeded")
 		return
@@ -371,22 +533,33 @@ func (s *store) putObject(w http.ResponseWriter, r *http.Request, bucketID, key 
 		writeError(w, http.StatusConflict, "insufficient_capacity")
 		return
 	}
-	b.objects[key] = &object{key: key, content: content, metadata: metadata, etag: etag, sizeBytes: size}
+	resource := bucketPath + "/" + bucketID + "/objects/" + key
+	status := http.StatusCreated
+	if existing != nil {
+		status = http.StatusOK
+	}
+	if b.versioning {
+		v := &objectVersion{versionID: s.nextVersionID(), content: content, metadata: metadata, etag: etag, sizeBytes: size}
+		b.objects[key] = append([]*objectVersion{v}, b.objects[key]...)
+		p.objectBytes += size
+		p.tenantUsed[b.tenant] += size
+		s.appendAudit(auditVersionCreated, resource, b.poolID, size)
+		w.Header().Set("ETag", etag)
+		w.Header().Set(versionHeader, v.versionID)
+		writeJSON(w, status, objectView{Key: key, SizeBytes: size, Metadata: metadata, ETag: etag, VersionID: v.versionID})
+		return
+	}
+	b.objects[key] = []*objectVersion{{content: content, metadata: metadata, etag: etag, sizeBytes: size}}
 	p.objectBytes += size - oldSize
 	p.tenantUsed[b.tenant] += size - oldSize
 	// An overwrite is recorded even when the size delta is zero.
-	resource := bucketPath + "/" + bucketID + "/objects/" + key
 	if existing != nil {
 		s.appendAudit(auditObjectOverwritten, resource, b.poolID, size-oldSize)
 	} else {
 		s.appendAudit(auditObjectCreated, resource, b.poolID, size)
 	}
-	status := http.StatusCreated
-	if existing != nil {
-		status = http.StatusOK
-	}
 	w.Header().Set("ETag", etag)
-	writeJSON(w, status, b.objects[key].view())
+	writeJSON(w, status, objectView{Key: key, SizeBytes: size, Metadata: metadata, ETag: etag})
 }
 
 // getObject serves both GET and HEAD; headOnly suppresses the body.
@@ -395,34 +568,60 @@ func (s *store) getObject(w http.ResponseWriter, r *http.Request, bucketID, key 
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	if r.URL.RawQuery != "" {
+	versionID, hasVersion, ok := parseVersionQuery(r.URL.RawQuery)
+	if !ok {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
 	s.mu.RLock()
 	b, ok := s.buckets[bucketID]
-	var o *object
-	if ok {
-		o = b.objects[key]
-	}
-	s.mu.RUnlock()
 	if !ok {
+		s.mu.RUnlock()
 		writeError(w, http.StatusNotFound, "bucket_not_found")
 		return
 	}
-	if o == nil {
-		writeError(w, http.StatusNotFound, "object_not_found")
+	if !b.versioning && r.URL.RawQuery != "" {
+		// Buckets without versioning keep the original no-query behavior.
+		s.mu.RUnlock()
+		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	for name, value := range o.metadata {
+	var v *objectVersion
+	errCode := ""
+	if hasVersion {
+		for _, candidate := range b.objects[key] {
+			if candidate.versionID == versionID {
+				v = candidate
+				break
+			}
+		}
+		if v == nil || v.deleteMarker {
+			v = nil
+			errCode = "object_version_not_found"
+		}
+	} else {
+		if v = b.visible(key); v == nil {
+			errCode = "object_not_found"
+		}
+	}
+	versioned := b.versioning
+	s.mu.RUnlock()
+	if errCode != "" {
+		writeError(w, http.StatusNotFound, errCode)
+		return
+	}
+	for name, value := range v.metadata {
 		w.Header().Set(metaPrefix+name, value)
 	}
-	w.Header().Set("ETag", o.etag)
+	w.Header().Set("ETag", v.etag)
+	if versioned {
+		w.Header().Set(versionHeader, v.versionID)
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", strconv.FormatInt(o.sizeBytes, 10))
+	w.Header().Set("Content-Length", strconv.FormatInt(v.sizeBytes, 10))
 	w.WriteHeader(http.StatusOK)
 	if !headOnly {
-		_, _ = w.Write(o.content)
+		_, _ = w.Write(v.content)
 	}
 }
 
@@ -431,7 +630,8 @@ func (s *store) deleteObject(w http.ResponseWriter, r *http.Request, bucketID, k
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	if r.URL.RawQuery != "" {
+	versionID, hasVersion, ok := parseVersionQuery(r.URL.RawQuery)
+	if !ok {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
@@ -442,14 +642,62 @@ func (s *store) deleteObject(w http.ResponseWriter, r *http.Request, bucketID, k
 		writeError(w, http.StatusNotFound, "bucket_not_found")
 		return
 	}
-	// Deleting an unknown or already-deleted object is a success with no
-	// state change, so only a real deletion records an event.
-	if o, exists := b.objects[key]; exists {
-		s.pools[b.poolID].objectBytes -= o.sizeBytes
-		s.pools[b.poolID].tenantUsed[b.tenant] -= o.sizeBytes
-		delete(b.objects, key)
-		s.appendAudit(auditObjectDeleted, bucketPath+"/"+bucketID+"/objects/"+key, b.poolID, -o.sizeBytes)
+	if !b.versioning {
+		if r.URL.RawQuery != "" {
+			// Buckets without versioning keep the original no-query behavior.
+			writeError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		// Deleting an unknown or already-deleted object is a success with no
+		// state change, so only a real deletion records an event.
+		if v := b.visible(key); v != nil {
+			s.pools[b.poolID].objectBytes -= v.sizeBytes
+			s.pools[b.poolID].tenantUsed[b.tenant] -= v.sizeBytes
+			delete(b.objects, key)
+			s.appendAudit(auditObjectDeleted, bucketPath+"/"+bucketID+"/objects/"+key, b.poolID, -v.sizeBytes)
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
 	}
+	resource := bucketPath + "/" + bucketID + "/objects/" + key
+	if hasVersion {
+		// Permanent deletion of one addressed generation; only a data
+		// version releases capacity.
+		versions := b.objects[key]
+		idx := -1
+		for i, v := range versions {
+			if v.versionID == versionID {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			writeError(w, http.StatusNotFound, "object_version_not_found")
+			return
+		}
+		v := versions[idx]
+		b.objects[key] = append(versions[:idx], versions[idx+1:]...)
+		if len(b.objects[key]) == 0 {
+			delete(b.objects, key)
+		}
+		if !v.deleteMarker {
+			s.pools[b.poolID].objectBytes -= v.sizeBytes
+			s.pools[b.poolID].tenantUsed[b.tenant] -= v.sizeBytes
+		}
+		s.appendAudit(auditVersionDeleted, resource, b.poolID, -v.sizeBytes)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	// Without a versionId the delete adds a delete marker on top of the
+	// key. When the newest generation already is a marker the request is a
+	// success with no state change, so nothing is recorded.
+	if versions := b.objects[key]; len(versions) > 0 && versions[0].deleteMarker {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	marker := &objectVersion{versionID: s.nextVersionID(), deleteMarker: true, metadata: map[string]string{}}
+	b.objects[key] = append([]*objectVersion{marker}, b.objects[key]...)
+	s.appendAudit(auditDeleteMarkerMade, resource, b.poolID, 0)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -496,8 +744,55 @@ func (s *store) listObjects(w http.ResponseWriter, r *http.Request, bucketID str
 		sort.Strings(keys)
 		items = make([]objectView, 0, len(keys))
 		for _, k := range keys {
-			if strings.HasPrefix(k, prefix) {
-				items = append(items, b.objects[k].view())
+			// Only the currently visible object of each key is listed.
+			v := b.visible(k)
+			if v != nil && strings.HasPrefix(k, prefix) {
+				items = append(items, objectView{Key: k, SizeBytes: v.sizeBytes, Metadata: v.metadata, ETag: v.etag})
+			}
+		}
+	}
+	s.mu.RUnlock()
+	if !ok {
+		writeError(w, http.StatusNotFound, "bucket_not_found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+// listObjectVersions handles GET /v1/buckets/{bucketId}/object-versions.
+// Every generation of every matching key is listed — data versions and
+// delete markers — ordered by key ascending, newest generation first within
+// one key.
+func (s *store) listObjectVersions(w http.ResponseWriter, r *http.Request, bucketID string) {
+	prefix, ok := parsePrefixQuery(r.URL.RawQuery)
+	if !ok || !validID(bucketID) {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	s.mu.RLock()
+	b, ok := s.buckets[bucketID]
+	var items []objectVersionView
+	if ok {
+		keys := make([]string, 0, len(b.objects))
+		for k := range b.objects {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		items = make([]objectVersionView, 0, len(keys))
+		for _, k := range keys {
+			if !strings.HasPrefix(k, prefix) {
+				continue
+			}
+			for i, v := range b.objects[k] {
+				items = append(items, objectVersionView{
+					Key:          k,
+					VersionID:    v.versionID,
+					IsLatest:     i == 0,
+					DeleteMarker: v.deleteMarker,
+					SizeBytes:    v.sizeBytes,
+					ETag:         v.etag,
+					Metadata:     v.metadata,
+				})
 			}
 		}
 	}

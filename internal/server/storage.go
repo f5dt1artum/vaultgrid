@@ -4,6 +4,7 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"sync"
 )
 
@@ -124,6 +125,16 @@ type store struct {
 	// the business state each event describes.
 	auditEvents []auditEvent
 	auditSeq    int64
+	// versionSeq backs nextVersionID; it only advances under mu.
+	versionSeq int64
+}
+
+// nextVersionID returns a unique, non-empty object version id. The counter
+// only advances under the store write lock, so ids are unique for the life of
+// the process (the store is in-memory and wiped on restart).
+func (s *store) nextVersionID() string {
+	s.versionSeq++
+	return "v" + strconv.FormatInt(s.versionSeq, 16)
 }
 
 func newStore() *store {
