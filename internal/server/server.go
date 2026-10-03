@@ -51,10 +51,11 @@ func Handler() http.Handler {
 }
 
 const (
-	storagePoolPath = "/v1/storage-pools"
-	volumePath      = "/v1/volumes"
-	snapshotPath    = "/v1/snapshots"
-	bucketPath      = "/v1/buckets"
+	storagePoolPath    = "/v1/storage-pools"
+	volumePath         = "/v1/volumes"
+	snapshotPath       = "/v1/snapshots"
+	bucketPath         = "/v1/buckets"
+	capacityReportPath = "/v1/capacity-report"
 )
 
 // route dispatches every non-healthz request. Paths it does not recognise
@@ -69,6 +70,10 @@ func (s *store) route(w http.ResponseWriter, r *http.Request) {
 		s.routeStoragePools(w, r)
 	case r.URL.Path == bucketPath || strings.HasPrefix(r.URL.Path, bucketPath+"/"):
 		s.routeBuckets(w, r)
+	case r.URL.Path == capacityReportPath:
+		s.routeCapacityReport(w, r)
+	case strings.HasPrefix(r.URL.Path, capacityReportPath+"/"):
+		writeError(w, http.StatusNotFound, "not_found")
 	default:
 		writeError(w, http.StatusNotFound, "not_found")
 	}

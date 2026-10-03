@@ -240,6 +240,25 @@ go run ./cmd/vaultgrid
 
 非法 key、元数据、查询参数、未知字段或格式错误返回 `400 invalid_request`。并发写删不会超配、重扣或残留部分状态。
 
+## 容量报表
+
+`GET /v1/capacity-report` 导出全部存储池的池级容量报表，只读且无副作用。只接受两个可选查询参数，各最多出现一次且必须有值：`format`（`json` 或 `csv`，缺省为 `json`）与 `poolId`（缺省时统计全部池，指定时只统计该池）。参数重复、未知、无值或取值非法返回 `400 invalid_request`；合法但不存在的 `poolId` 返回 `404 pool_not_found`。该路径仅允许 `GET`，其他方法返回 `405 method_not_allowed`（带 `Allow: GET`），额外子路径返回 `404 not_found`。
+
+JSON 响应：
+
+```json
+{
+  "summary": {"rawCapacityBytes": 3000, "reservationBytes": 200, "volumeBytes": 400, "snapshotBytes": 200, "objectBytes": 50, "allocatedBytes": 850, "availableBytes": 2150},
+  "items": [
+    {"poolId": "pool-a", "rawCapacityBytes": 2000, "reservationBytes": 100, "volumeBytes": 200, "snapshotBytes": 200, "objectBytes": 50, "allocatedBytes": 550, "availableBytes": 1450}
+  ]
+}
+```
+
+`items` 按池 id 升序；`summary` 为各池同名字段之和（无 `poolId`）。无池时 `summary` 全为零且 `items` 为空数组；筛选单池时 `summary` 等于该池数值。`allocatedBytes` 恒等于预留、卷、快照、对象四类占用之和，`availableBytes` 恒等于 `rawCapacityBytes - allocatedBytes`。克隆按卷计入目标池，快照计入源池，空桶不计量。
+
+`format=csv` 时返回 UTF-8 CSV（`Content-Type: text/csv; charset=utf-8`），表头固定为 `poolId,rawCapacityBytes,reservationBytes,volumeBytes,snapshotBytes,objectBytes,allocatedBytes,availableBytes`，之后只输出同序池行，数字为十进制整数；无池时仅输出表头。两种格式口径一致，整份报表对应单一状态快照。
+
 ## 错误与路由
 
 错误响应统一为：
@@ -251,7 +270,7 @@ go run ./cmd/vaultgrid
 | HTTP | code | 场景 |
 | --- | --- | --- |
 | 400 | `invalid_request` | 未知字段、空设备集、非法 id、容量或版本非正/非整数、非法 key/元数据/查询参数等，且不产生部分状态 |
-| 404 | `pool_not_found` | 查询、预留或删除不存在的池，或向不存在的目标池克隆、建桶 |
+| 404 | `pool_not_found` | 查询、预留或删除不存在的池，向不存在的目标池克隆、建桶，或容量报表筛选不存在的池 |
 | 404 | `volume_not_found` | 查询、绑定、解绑或删除不存在的卷，或为不存在的卷创建快照 |
 | 404 | `snapshot_not_found` | 查询、删除不存在的快照，或基于不存在的快照克隆 |
 | 404 | `bucket_not_found` | 查询、删除不存在的桶，或向不存在的桶读写对象 |
