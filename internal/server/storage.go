@@ -50,6 +50,7 @@ type reservationView struct {
 type reservation struct {
 	requestID string
 	bytes     int64
+	tenant    string
 }
 
 type pool struct {
@@ -60,6 +61,12 @@ type pool struct {
 	volumeBytes   int64 // total sizeBytes of volumes in this pool
 	snapshotBytes int64 // total sizeBytes of snapshots held in this pool
 	objectBytes   int64 // total sizeBytes of objects in buckets of this pool
+	// tenantQuotas maps tenant id to its byte limit within this pool; tenants
+	// without an entry are unlimited. tenantUsed tracks each tenant's current
+	// byte usage (reservations, volumes, snapshots and objects) in this pool.
+	// Both live only in memory and are wiped on restart.
+	tenantQuotas map[string]int64
+	tenantUsed   map[string]int64
 }
 
 // volume is a capacity allocation inside a pool with an optional exclusive
@@ -73,6 +80,7 @@ type volume struct {
 	generation  int64
 	binding     string // "" when unbound
 	cloneSource string // snapshot id when produced via a clone
+	tenant      string // tenant the volume's bytes are charged to
 }
 
 func (p *pool) allocated() int64 {
@@ -81,6 +89,26 @@ func (p *pool) allocated() int64 {
 		total += r.bytes
 	}
 	return total
+}
+
+// checkAdd returns the conflict code that adding delta bytes for tenant
+// would cause, or "" when the addition fits both the tenant quota (when one
+// is configured) and the pool capacity. Callers hold the store write lock,
+// so the check and the subsequent charge are atomic and concurrent requests
+// can never break either limit.
+func (p *pool) checkAdd(tenant string, delta int64) string {
+	if limit, ok := p.tenantQuotas[tenant]; ok && p.tenantUsed[tenant] > limit-delta {
+		return "tenant_quota_exceeded"
+	}
+	if p.allocated() > p.rawCapacity-delta {
+		return "insufficient_capacity"
+	}
+	return ""
+}
+
+// charge adds delta (negative to release) to the tenant's usage in the pool.
+func (p *pool) charge(tenant string, delta int64) {
+	p.tenantUsed[tenant] += delta
 }
 
 func (p *pool) view() poolView {
@@ -207,6 +235,8 @@ func (s *store) createPool(w http.ResponseWriter, r *http.Request) {
 		devices:      devices,
 		rawCapacity:  rawCapacity,
 		reservations: make(map[string]reservation),
+		tenantQuotas: make(map[string]int64),
+		tenantUsed:   make(map[string]int64),
 	}
 	s.pools[in.ID] = p
 	for _, d := range devices {
