@@ -2,7 +2,7 @@
 
 这是一个面向存储与数据管理的块/对象存储与卷管理控制面。长期目标是提供存储池与卷生命周期、S3 风格对象接口、纠删码与多副本放置、一致性哈希与再平衡、快照与克隆、完整性自愈和配额，把存储控制面沉淀为可复用服务。
 
-仓库采用 Go。当前提供进程健康检查、存储池目录、池级容量预留、卷生命周期与单节点独占绑定、内存态卷快照与基于快照的跨池克隆、S3 风格的桶与对象接口、池级容量报表导出以及内存态审计事件；每个能力都定义可观察的公共行为、兼容边界和失败语义，不依赖未公开内部 API。所有状态保存在内存中，进程重启后清空。
+仓库采用 Go。当前提供进程健康检查、存储池目录、池级容量预留、卷生命周期与单节点独占绑定、内存态卷快照、快照原地恢复与基于快照的跨池克隆、S3 风格的桶与对象接口、池级容量报表导出以及内存态审计事件；每个能力都定义可观察的公共行为、兼容边界和失败语义，不依赖未公开内部 API。所有状态保存在内存中，进程重启后清空。
 
 ## 启动
 
@@ -158,6 +158,26 @@ go run ./cmd/vaultgrid
 检查与提交在同一临界区内完成，因此与绑定、删除、快照创建或其他容量分配并发时不会超配或重扣。大小改变后，池的 `volumeBytes`、`allocatedBytes`、`availableBytes`、租户配额用量以及 JSON、CSV 容量报表立即按有符号差额更新；审计日志原子追加一条 `volume.resized` 事件，`resource` 为 `/v1/volumes/{id}/size`，`bytesDelta` 为有符号差额（扩容为正、缩容为负），同大小请求与失败不记录事件。
 
 已有快照保留创建时的大小、源代数与源池占用，不受源卷调整影响；后续克隆继续使用快照大小。克隆卷与普通卷一样支持调整。卷被调整后，原创建参数的幂等重放仍返回 `200` 及当前卷表示（创建幂等只比对 `id`、`poolId` 与租户），其他参数仍返回 `409 volume_exists`。
+
+### 恢复快照到卷（原地）
+
+`POST /v1/volumes/{id}/restore`
+
+```json
+{"snapshotId": "snap-1", "expectedGeneration": 2}
+```
+
+把卷原地恢复到其自身某个快照记录的大小：不创建新卷，也不删除快照。该子资源只允许 `POST`，且不接受任何查询参数。`expectedGeneration` 为非负 JSON 整数且必须等于卷当前的 `generation`，卷必须未绑定：
+
+- 成功返回 `200` 及当前卷表示：`sizeBytes` 变为快照大小，`binding` 保持 `null`，`generation` 无论大小是否改变都加一（恢复本身产生了新状态，与同大小调整的幂等空操作不同）。
+- 只允许使用目标卷**当前实例**产生的快照：其他卷的快照，或卷删除后以同一 id 重建前的旧快照，都返回 `409 snapshot_source_mismatch`。
+- 卷不存在返回 `404 volume_not_found`；快照不存在（含已删除）返回 `404 snapshot_not_found`。
+- 卷已绑定返回 `409 volume_in_use`，该判断优先于版本判断；版本不符返回 `409 stale_generation`。
+- 恢复导致扩容时，按卷的既有租户先检查租户配额、再检查池容量，分别返回 `409 tenant_quota_exceeded` 与 `409 insufficient_capacity`；缩容立即释放容量与租户用量，不受这两项限制。
+- 正文缺字段、未知字段、标识或数值非法，或携带查询参数返回 `400 invalid_request`。
+- 任何失败都不改变卷、快照、容量计量、租户用量或审计日志。
+
+检查与提交在同一临界区内完成，与绑定、调整大小、删除卷、删除快照并发时等价于某个串行顺序。成功提交后，池容量、容量报表与租户用量按新旧大小的有符号差额一致更新，并原子追加一条 `volume.restored` 审计事件：`resource` 为 `/v1/volumes/{id}/restore`，`poolId` 为目标池，`bytesDelta` 为有符号差额（差额为零也记录）。快照本身保持不动，继续计入源池占用。
 
 ## 快照
 
@@ -379,7 +399,7 @@ poolId,rawCapacityBytes,reservationBytes,volumeBytes,snapshotBytes,objectBytes,a
 ```
 
 - `sequence` 从 1 起连续递增；并发请求按实际提交状态的先后编号。
-- `action` 取值：`pool.created`、`pool.deleted`、`reservation.created`、`reservation.deleted`、`volume.created`、`volume.deleted`、`volume.bound`、`volume.unbound`、`volume.resized`、`snapshot.created`、`snapshot.deleted`、`clone.created`、`bucket.created`、`bucket.deleted`、`object.created`、`object.overwritten`、`object.deleted`、`bucket.versioning-enabled`、`object.version-created`、`object.delete-marker-created`、`object.version-deleted`、`tenant-quota.created`、`tenant-quota.updated`、`tenant-quota.deleted`。
+- `action` 取值：`pool.created`、`pool.deleted`、`reservation.created`、`reservation.deleted`、`volume.created`、`volume.deleted`、`volume.bound`、`volume.unbound`、`volume.resized`、`volume.restored`、`snapshot.created`、`snapshot.deleted`、`clone.created`、`bucket.created`、`bucket.deleted`、`object.created`、`object.overwritten`、`object.deleted`、`bucket.versioning-enabled`、`object.version-created`、`object.delete-marker-created`、`object.version-deleted`、`tenant-quota.created`、`tenant-quota.updated`、`tenant-quota.deleted`。
 - `resource` 是事件对应资源的公开路径（预留为 `/v1/storage-pools/{id}/reservations/{requestId}`，绑定为 `/v1/volumes/{id}/binding`，卷大小调整为 `/v1/volumes/{id}/size`，对象为 `/v1/buckets/{id}/objects/{key}`，桶版本控制为 `/v1/buckets/{id}/versioning`，克隆卷为 `/v1/volumes/{id}`，租户配额为 `/v1/storage-pools/{id}/tenant-quotas/{tenantId}`）。
 - `poolId` 是事件所属池：卷、快照、桶、预留、对象、租户配额归属其所在池；克隆计入目标池。
 - `bytesDelta` 是该次提交对池 `allocatedBytes` 的有符号变化：创建为正、删除为负、容量无关的动作（建删池、建删桶、绑定解绑、租户配额增删改）为 `0`。对象覆盖为 `新大小-旧大小`；**即使容量差为零也记录 `object.overwritten`**。卷调整为 `新大小-旧大小`，同大小请求不记录 `volume.resized`。版本控制桶中：每个新建数据版记录 `object.version-created`，`bytesDelta` 为该版完整大小（旧版仍计费）；删除标记记录 `object.delete-marker-created`，`bytesDelta` 为 `0`；永久删除版本记录 `object.version-deleted`，仅数据版 `bytesDelta` 为负、删除标记为 `0`。启用版本控制只在首次记录一次 `bucket.versioning-enabled`（`bytesDelta` 为 `0`），幂等重放不记录。
@@ -432,6 +452,7 @@ poolId,rawCapacityBytes,reservationBytes,volumeBytes,snapshotBytes,objectBytes,a
 | 409 | `volume_in_use` | 删除、创建快照或调整大小仍绑定在节点上的卷（调整大小时优先于版本判断） |
 | 409 | `stale_generation` | 绑定/解绑、创建快照或调整大小时 expectedGeneration 与当前版本不符 |
 | 409 | `snapshot_exists` | 同快照 id 重试但源卷或源版本不同 |
+| 409 | `snapshot_source_mismatch` | 恢复快照不属于目标卷的当前实例（其他卷的快照，或卷删除重建前的旧快照） |
 | 409 | `bucket_exists` | 同桶 id 重试但 poolId 不同 |
 | 409 | `bucket_not_empty` | 删除仍有可见对象、历史数据版或删除标记的桶 |
 | 409 | `quota_below_usage` | 租户配额限额低于该租户当前用量 |
