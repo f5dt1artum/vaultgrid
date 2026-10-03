@@ -2,7 +2,7 @@
 
 这是一个面向存储与数据管理的块/对象存储与卷管理控制面。长期目标是提供存储池与卷生命周期、S3 风格对象接口、纠删码与多副本放置、一致性哈希与再平衡、快照与克隆、完整性自愈和配额，把存储控制面沉淀为可复用服务。
 
-仓库采用 Go。当前提供进程健康检查、存储池目录、池级容量预留、卷生命周期与单节点独占绑定、内存态卷快照与基于快照的跨池克隆，以及 S3 风格的桶与对象接口；每个能力都定义可观察的公共行为、兼容边界和失败语义，不依赖未公开内部 API。所有状态保存在内存中，进程重启后清空。
+仓库采用 Go。当前提供进程健康检查、存储池目录、池级容量预留、卷生命周期与单节点独占绑定、内存态卷快照与基于快照的跨池克隆、S3 风格的桶与对象接口，以及池级容量报表导出；每个能力都定义可观察的公共行为、兼容边界和失败语义，不依赖未公开内部 API。所有状态保存在内存中，进程重启后清空。
 
 ## 启动
 
@@ -240,6 +240,31 @@ go run ./cmd/vaultgrid
 
 非法 key、元数据、查询参数、未知字段或格式错误返回 `400 invalid_request`。并发写删不会超配、重扣或残留部分状态。
 
+## 容量报表
+
+`GET /v1/capacity-report` 导出池级容量报表，只接受两个可选查询参数：
+
+- `format`：`json`（缺省）或 `csv`。
+- `poolId`：缺省时统计全部池，指定时只统计该池。
+
+JSON 响应为 `{"summary":{...},"items":[...]}`，`items` 按池 id 升序。每个池项包含：
+
+```json
+{"poolId":"pool-a","rawCapacityBytes":1500,"reservationBytes":100,"volumeBytes":200,"snapshotBytes":200,"objectBytes":50,"allocatedBytes":550,"availableBytes":950}
+```
+
+`summary` 包含除 `poolId` 外的同名字段，为各池汇总；无池时汇总均为零且 `items` 为空，筛选单池时汇总等于该池数值。四类明细沿用现有归属：克隆按卷计入目标池，快照计入源池，空桶不计量。每个池及汇总都满足 `allocatedBytes` 等于四类占用之和、`availableBytes` 等于 `rawCapacityBytes` 减去 `allocatedBytes`；并发变更时整份报表对应单一状态。
+
+CSV 响应为 UTF-8、`text/csv`，表头固定为：
+
+```
+poolId,rawCapacityBytes,reservationBytes,volumeBytes,snapshotBytes,objectBytes,allocatedBytes,availableBytes
+```
+
+只输出同序池行（不含汇总行），无池时仅输出表头，数字为十进制整数，与 JSON 口径一致。
+
+`poolId` 不符合 id 规则、`format` 不是 `json` 或 `csv`、参数重复、出现未知参数或参数无值时返回 `400 invalid_request`；合法但不存在的 `poolId` 返回 `404 pool_not_found`。该路径仅允许 `GET`，其他方法返回 `405 method_not_allowed` 且带 `Allow: GET`；额外子路径返回 `404 not_found`。报表只读内存、无副作用，重启后遵循现有清空语义。
+
 ## 错误与路由
 
 错误响应统一为：
@@ -251,7 +276,7 @@ go run ./cmd/vaultgrid
 | HTTP | code | 场景 |
 | --- | --- | --- |
 | 400 | `invalid_request` | 未知字段、空设备集、非法 id、容量或版本非正/非整数、非法 key/元数据/查询参数等，且不产生部分状态 |
-| 404 | `pool_not_found` | 查询、预留或删除不存在的池，或向不存在的目标池克隆、建桶 |
+| 404 | `pool_not_found` | 查询、预留或删除不存在的池，向不存在的目标池克隆、建桶，或按不存在的池导出报表 |
 | 404 | `volume_not_found` | 查询、绑定、解绑或删除不存在的卷，或为不存在的卷创建快照 |
 | 404 | `snapshot_not_found` | 查询、删除不存在的快照，或基于不存在的快照克隆 |
 | 404 | `bucket_not_found` | 查询、删除不存在的桶，或向不存在的桶读写对象 |
