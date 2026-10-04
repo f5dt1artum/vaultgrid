@@ -2,7 +2,7 @@
 
 这是一个面向存储与数据管理的块/对象存储与卷管理控制面。长期目标是提供存储池与卷生命周期、S3 风格对象接口、纠删码与多副本放置、一致性哈希与再平衡、快照与克隆、完整性自愈和配额，把存储控制面沉淀为可复用服务。
 
-仓库采用 Go。当前提供进程健康检查、存储池目录、池级容量预留、卷生命周期与单节点独占绑定、内存态卷快照、快照原地恢复与基于快照的跨池克隆、S3 风格的桶与对象接口、池级容量报表导出以及内存态审计事件；每个能力都定义可观察的公共行为、兼容边界和失败语义，不依赖未公开内部 API。所有状态保存在内存中，进程重启后清空。
+仓库采用 Go。当前提供进程健康检查、存储池目录、池级容量预留、卷生命周期与单节点独占绑定、内存态卷快照、同池多卷一致性快照组、快照原地恢复与基于快照的跨池克隆、S3 风格的桶与对象接口、池级容量报表导出以及内存态审计事件；每个能力都定义可观察的公共行为、兼容边界和失败语义，不依赖未公开内部 API。所有状态保存在内存中，进程重启后清空。
 
 ## 启动
 
@@ -208,7 +208,7 @@ go run ./cmd/vaultgrid
 
 - `GET /v1/snapshots` 返回 `{"items":[...]}`，按快照 id 升序。
 - `GET /v1/snapshots/{id}` 返回单个快照；不存在返回 `404 snapshot_not_found`。
-- `DELETE /v1/snapshots/{id}` 返回 `204` 并立即向源池归还容量；不存在返回 `404 snapshot_not_found`。
+- `DELETE /v1/snapshots/{id}` 返回 `204` 并立即向源池归还容量；不存在返回 `404 snapshot_not_found`；快照属于某个快照组时返回 `409 snapshot_in_group`（只能随整组删除）。
 
 只要池中仍存在快照（即使源卷已删除），删除池仍返回 `409 pool_not_empty`。
 
@@ -229,6 +229,45 @@ go run ./cmd/vaultgrid
 - 非法 id、缺失字段、未知字段等返回 `400 invalid_request`。
 
 并发创建快照或克隆都不会重复计量或使池超配。
+
+## 快照组
+
+快照组把同一池中多个卷的快照作为一个原子单元创建和删除：整组要么全部提交，要么不留任何组、快照、计量或审计变化。组内快照就是普通快照，照常支持列出、查询、恢复与克隆，并按 `sizeBytes` 计入源池。
+
+### 创建快照组（幂等）
+
+`POST /v1/snapshot-groups`
+
+```json
+{
+  "id": "grp-1",
+  "members": [
+    {"volumeId": "vol-1", "snapshotId": "snap-1", "expectedGeneration": 0},
+    {"volumeId": "vol-2", "snapshotId": "snap-2", "expectedGeneration": 1}
+  ]
+}
+```
+
+`members` 含 2 至 64 个成员；`volumeId` 与 `snapshotId` 在请求内分别唯一，所有卷须属于同一池。成功返回 `201`，组表示包含 `id`、`poolId` 和按 `snapshotId` 升序的快照项：
+
+```json
+{"id":"grp-1","poolId":"pool-a","snapshots":[
+  {"id":"snap-1","sourceVolumeId":"vol-1","poolId":"pool-a","sizeBytes":600,"sourceGeneration":0},
+  {"id":"snap-2","sourceVolumeId":"vol-2","poolId":"pool-a","sizeBytes":400,"sourceGeneration":1}
+]}
+```
+
+- 相同组 `id`、相同成员映射（卷→快照，与顺序无关）与相同版本的重试返回 `200` 及原结果，不重复计量或审计；源卷在此之后被删除，重试仍返回 `200`。
+- 相同组 `id` 但成员映射或版本不同返回 `409 snapshot_group_exists`。
+- 按成员顺序检查：卷不存在返回 `404 volume_not_found`；卷已绑定返回 `409 volume_in_use`；版本不符返回 `409 stale_generation`。
+- 成员卷不属于同一池返回 `409 cross_pool_snapshot_group`；任一 `snapshotId` 已存在返回 `409 snapshot_exists`。
+- 成员大小按租户聚合后先检查租户配额、再检查池容量，分别返回 `409 tenant_quota_exceeded` 与 `409 insufficient_capacity`。
+- 非法 id、成员数越界、成员重复、缺失/非法字段或携带查询参数返回 `400 invalid_request`。
+- 任何失败都不留下组、快照、计量或审计变化；整组提交与其他卷和快照写请求等价于某个串行顺序。
+
+### 删除快照组
+
+`DELETE /v1/snapshot-groups/{id}` 原子删除全部成员快照，并立即向共同池归还容量、释放各租户用量，返回 `204`；组不存在返回 `404 snapshot_group_not_found`。已从组内快照克隆出的卷不受影响。直接 `DELETE /v1/snapshots/{id}` 删除组内快照返回 `409 snapshot_in_group`。
 
 ## 桶与对象
 
@@ -411,10 +450,10 @@ poolId,rawCapacityBytes,reservationBytes,volumeBytes,snapshotBytes,objectBytes,a
 ```
 
 - `sequence` 从 1 起连续递增；并发请求按实际提交状态的先后编号。
-- `action` 取值：`pool.created`、`pool.deleted`、`reservation.created`、`reservation.deleted`、`volume.created`、`volume.deleted`、`volume.bound`、`volume.unbound`、`volume.resized`、`volume.restored`、`snapshot.created`、`snapshot.deleted`、`clone.created`、`bucket.created`、`bucket.deleted`、`object.created`、`object.overwritten`、`object.deleted`、`bucket.versioning-enabled`、`object.version-created`、`object.delete-marker-created`、`object.version-deleted`、`tenant-quota.created`、`tenant-quota.updated`、`tenant-quota.deleted`。
-- `resource` 是事件对应资源的公开路径（预留为 `/v1/storage-pools/{id}/reservations/{requestId}`，绑定为 `/v1/volumes/{id}/binding`，卷大小调整为 `/v1/volumes/{id}/size`，对象为 `/v1/buckets/{id}/objects/{key}`，桶版本控制为 `/v1/buckets/{id}/versioning`，克隆卷为 `/v1/volumes/{id}`，租户配额为 `/v1/storage-pools/{id}/tenant-quotas/{tenantId}`）。
-- `poolId` 是事件所属池：卷、快照、桶、预留、对象、租户配额归属其所在池；克隆计入目标池。
-- `bytesDelta` 是该次提交对池 `allocatedBytes` 的有符号变化：创建为正、删除为负、容量无关的动作（建删池、建删桶、绑定解绑、租户配额增删改）为 `0`。对象覆盖为 `新大小-旧大小`；**即使容量差为零也记录 `object.overwritten`**。卷调整为 `新大小-旧大小`，同大小请求不记录 `volume.resized`。版本控制桶中：每个新建数据版记录 `object.version-created`，`bytesDelta` 为该版完整大小（旧版仍计费）；删除标记记录 `object.delete-marker-created`，`bytesDelta` 为 `0`；永久删除版本记录 `object.version-deleted`，仅数据版 `bytesDelta` 为负、删除标记为 `0`。启用版本控制只在首次记录一次 `bucket.versioning-enabled`（`bytesDelta` 为 `0`），幂等重放不记录。
+- `action` 取值：`pool.created`、`pool.deleted`、`reservation.created`、`reservation.deleted`、`volume.created`、`volume.deleted`、`volume.bound`、`volume.unbound`、`volume.resized`、`volume.restored`、`snapshot.created`、`snapshot.deleted`、`snapshot-group.created`、`snapshot-group.deleted`、`clone.created`、`bucket.created`、`bucket.deleted`、`object.created`、`object.overwritten`、`object.deleted`、`bucket.versioning-enabled`、`object.version-created`、`object.delete-marker-created`、`object.version-deleted`、`tenant-quota.created`、`tenant-quota.updated`、`tenant-quota.deleted`。
+- `resource` 是事件对应资源的公开路径（预留为 `/v1/storage-pools/{id}/reservations/{requestId}`，绑定为 `/v1/volumes/{id}/binding`，卷大小调整为 `/v1/volumes/{id}/size`，对象为 `/v1/buckets/{id}/objects/{key}`，桶版本控制为 `/v1/buckets/{id}/versioning`，克隆卷为 `/v1/volumes/{id}`，快照组为 `/v1/snapshot-groups/{id}`，租户配额为 `/v1/storage-pools/{id}/tenant-quotas/{tenantId}`）。
+- `poolId` 是事件所属池：卷、快照、桶、预留、对象、租户配额归属其所在池；快照组归属成员的共同池；克隆计入目标池。
+- `bytesDelta` 是该次提交对池 `allocatedBytes` 的有符号变化：创建为正、删除为负、容量无关的动作（建删池、建删桶、绑定解绑、租户配额增删改）为 `0`。快照组创建为成员总字节的正值，删除为其负值。对象覆盖为 `新大小-旧大小`；**即使容量差为零也记录 `object.overwritten`**。卷调整为 `新大小-旧大小`，同大小请求不记录 `volume.resized`。版本控制桶中：每个新建数据版记录 `object.version-created`，`bytesDelta` 为该版完整大小（旧版仍计费）；删除标记记录 `object.delete-marker-created`，`bytesDelta` 为 `0`；永久删除版本记录 `object.version-deleted`，仅数据版 `bytesDelta` 为负、删除标记为 `0`。启用版本控制只在首次记录一次 `bucket.versioning-enabled`（`bytesDelta` 为 `0`），幂等重放不记录。
 
 ### 查询事件
 
@@ -463,7 +502,11 @@ poolId,rawCapacityBytes,reservationBytes,volumeBytes,snapshotBytes,objectBytes,a
 | 409 | `volume_already_bound` | 已绑定卷试图改绑其他节点 |
 | 409 | `volume_in_use` | 删除、创建快照或调整大小仍绑定在节点上的卷（调整大小时优先于版本判断） |
 | 409 | `stale_generation` | 绑定/解绑、创建快照或调整大小时 expectedGeneration 与当前版本不符 |
-| 409 | `snapshot_exists` | 同快照 id 重试但源卷或源版本不同 |
+| 409 | `snapshot_exists` | 同快照 id 重试但源卷或源版本不同，或快照组的成员 snapshotId 已存在 |
+| 409 | `snapshot_group_exists` | 同快照组 id 重试但成员映射或版本不同 |
+| 409 | `cross_pool_snapshot_group` | 快照组成员卷不属于同一池 |
+| 409 | `snapshot_in_group` | 直接删除仍属于某个快照组的快照 |
+| 404 | `snapshot_group_not_found` | 删除不存在的快照组 |
 | 409 | `snapshot_source_mismatch` | 恢复快照不属于目标卷的当前实例（其他卷的快照，或卷删除重建前的旧快照） |
 | 409 | `bucket_exists` | 同桶 id 重试但 poolId 不同 |
 | 409 | `bucket_not_empty` | 删除仍有可见对象、历史数据版或删除标记的桶 |

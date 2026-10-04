@@ -117,12 +117,13 @@ func (p *pool) view() poolView {
 
 // store is the in-memory state of the service. It is wiped on restart.
 type store struct {
-	mu          sync.RWMutex
-	pools       map[string]*pool
-	volumes     map[string]*volume
-	snapshots   map[string]*snapshot
-	buckets     map[string]*bucket
-	deviceOwner map[string]string
+	mu             sync.RWMutex
+	pools          map[string]*pool
+	volumes        map[string]*volume
+	snapshots      map[string]*snapshot
+	snapshotGroups map[string]*snapshotGroup
+	buckets        map[string]*bucket
+	deviceOwner    map[string]string
 	// auditEvents is the append-only audit log; auditSeq is the sequence of
 	// its last entry (0 while empty). Both are mutated under mu, together with
 	// the business state each event describes.
@@ -136,11 +137,12 @@ type store struct {
 
 func newStore() *store {
 	return &store{
-		pools:       make(map[string]*pool),
-		volumes:     make(map[string]*volume),
-		snapshots:   make(map[string]*snapshot),
-		buckets:     make(map[string]*bucket),
-		deviceOwner: make(map[string]string),
+		pools:          make(map[string]*pool),
+		volumes:        make(map[string]*volume),
+		snapshots:      make(map[string]*snapshot),
+		snapshotGroups: make(map[string]*snapshotGroup),
+		buckets:        make(map[string]*bucket),
+		deviceOwner:    make(map[string]string),
 	}
 }
 

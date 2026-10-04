@@ -31,7 +31,9 @@ type snapshotView struct {
 // deleted. tenant is inherited from the source volume. sourceInstanceID pins
 // the snapshot to the exact volume instance that produced it, so a snapshot
 // can only be restored into that instance — never into a later volume that
-// happens to reuse the same id.
+// happens to reuse the same id. groupID names the snapshot group the snapshot
+// belongs to ("" for a standalone snapshot); a group member can only be
+// deleted together with its whole group.
 type snapshot struct {
 	id               string
 	sourceVolumeID   string
@@ -40,6 +42,7 @@ type snapshot struct {
 	sourceGeneration int64
 	tenant           string
 	sourceInstanceID int64
+	groupID          string
 }
 
 func (s *snapshot) view() snapshotView {
@@ -199,6 +202,11 @@ func (s *store) deleteSnapshot(w http.ResponseWriter, id string) {
 	snap, ok := s.snapshots[id]
 	if !ok {
 		writeError(w, http.StatusNotFound, "snapshot_not_found")
+		return
+	}
+	// A group member is deleted only together with its whole group.
+	if snap.groupID != "" {
+		writeError(w, http.StatusConflict, "snapshot_in_group")
 		return
 	}
 	s.pools[snap.poolID].snapshotBytes -= snap.sizeBytes
