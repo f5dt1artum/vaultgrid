@@ -4,7 +4,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -660,6 +662,121 @@ func (s *store) putObjectVersioned(w http.ResponseWriter, b *bucket, p *pool, ob
 	writeJSON(w, status, created.versionedView(key))
 }
 
+// byteRange is one parsed single byte-range spec. When suffix is true the
+// client asked for the final length bytes and start/end are unset; the caller
+// resolves it against the object length.
+type byteRange struct {
+	start, end int64
+	suffix     bool
+	length     int64 // suffix length when suffix is true
+}
+
+// parseDecimalDigits parses a non-empty string of ASCII decimal digits. A
+// value larger than int64 saturates to MaxInt64 so overlong specs are judged
+// against the object length instead of failing as malformed.
+func parseDecimalDigits(s string) (int64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	n := int64(0)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		d := int64(c - '0')
+		if n > (math.MaxInt64-d)/10 {
+			return math.MaxInt64, true
+		}
+		n = n*10 + d
+	}
+	return n, true
+}
+
+// parseRangeHeader validates the Range header for object reads. Only a single
+// byte range in one of the forms bytes=start-end, bytes=start- or
+// bytes=-suffixLength is accepted; any other unit, multiple ranges, empty
+// specs, whitespace or non-decimal values are rejected. present reports
+// whether a Range header was carried at all; ok is false for a malformed one.
+func parseRangeHeader(h http.Header) (br byteRange, present, ok bool) {
+	values, exists := h["Range"]
+	if !exists {
+		return byteRange{}, false, true
+	}
+	if len(values) != 1 {
+		return byteRange{}, true, false
+	}
+	raw := values[0]
+	if !strings.HasPrefix(raw, "bytes=") {
+		return byteRange{}, true, false
+	}
+	spec := raw[len("bytes="):]
+	if spec == "" || strings.ContainsRune(spec, ',') {
+		return byteRange{}, true, false
+	}
+	// No whitespace is legal anywhere in a single byte-range spec.
+	for _, r := range spec {
+		if unicode.IsSpace(r) {
+			return byteRange{}, true, false
+		}
+	}
+	if strings.HasPrefix(spec, "-") {
+		// Suffix form: the suffix length must be present and non-zero.
+		n, valid := parseDecimalDigits(spec[1:])
+		if !valid || n == 0 {
+			return byteRange{}, true, false
+		}
+		return byteRange{suffix: true, length: n}, true, true
+	}
+	first, rest, cut := strings.Cut(spec, "-")
+	if !cut {
+		return byteRange{}, true, false
+	}
+	start, valid := parseDecimalDigits(first)
+	if !valid {
+		return byteRange{}, true, false
+	}
+	if rest == "" {
+		// Open-ended form: bytes=start-
+		return byteRange{start: start, end: -1}, true, true
+	}
+	if strings.Contains(rest, "-") {
+		return byteRange{}, true, false
+	}
+	end, valid := parseDecimalDigits(rest)
+	if !valid {
+		return byteRange{}, true, false
+	}
+	return byteRange{start: start, end: end}, true, true
+}
+
+// resolveRange maps a parsed range onto an object of the given complete byte
+// length, clamping an overlong end and an overlong suffix. satisfiable is
+// false exactly when the spec cannot return any byte; the caller answers 416
+// in that case (which includes every range against an empty object).
+func resolveRange(br byteRange, size int64) (start, end int64, satisfiable bool) {
+	if size == 0 {
+		return 0, -1, false
+	}
+	if br.suffix {
+		if br.length >= size {
+			return 0, size - 1, true
+		}
+		return size - br.length, size - 1, true
+	}
+	if br.start >= size {
+		return 0, -1, false
+	}
+	end = br.end
+	if end < 0 || end >= size {
+		end = size - 1
+	}
+	if br.start > end {
+		return 0, -1, false
+	}
+	return br.start, end, true
+}
+
 // getObject serves both GET and HEAD; headOnly suppresses the body.
 func (s *store) getObject(w http.ResponseWriter, r *http.Request, bucketID, key string, headOnly bool) {
 	if !validID(bucketID) || !validObjectKey(key) {
@@ -720,6 +837,25 @@ func (s *store) getObject(w http.ResponseWriter, r *http.Request, bucketID, key 
 		writeError(w, http.StatusNotFound, notFoundCode)
 		return
 	}
+	// Bucket, key and versionId are settled and the target version selected
+	// before Range is examined, so lookup errors keep their original 404.
+	br, rangePresent, rangeOK := parseRangeHeader(r.Header)
+	if !rangeOK {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	var rangeStart, rangeEnd int64
+	if rangePresent {
+		var satisfiable bool
+		rangeStart, rangeEnd, satisfiable = resolveRange(br, v.sizeBytes)
+		if !satisfiable {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", v.sizeBytes))
+			writeError(w, http.StatusRequestedRangeNotSatisfiable, "range_not_satisfiable")
+			return
+		}
+	}
+	// Only successful (200/206) responses carry the object representation
+	// headers.
 	for name, value := range v.metadata {
 		w.Header().Set(metaPrefix+name, value)
 	}
@@ -728,10 +864,23 @@ func (s *store) getObject(w http.ResponseWriter, r *http.Request, bucketID, key 
 		w.Header().Set(versionHeader, v.versionID)
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", strconv.FormatInt(v.sizeBytes, 10))
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Accept-Ranges", "bytes")
+	if !rangePresent {
+		w.Header().Set("Content-Length", strconv.FormatInt(v.sizeBytes, 10))
+		w.WriteHeader(http.StatusOK)
+		if !headOnly {
+			_, _ = w.Write(v.content)
+		}
+		return
+	}
+	length := rangeEnd - rangeStart + 1
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, v.sizeBytes))
+	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+	w.WriteHeader(http.StatusPartialContent)
+	// The selected objectVersion is immutable once stored, so its content
+	// slice answers even a concurrent overwrite or deletion without the lock.
 	if !headOnly {
-		_, _ = w.Write(v.content)
+		_, _ = w.Write(v.content[rangeStart : rangeEnd+1])
 	}
 }
 

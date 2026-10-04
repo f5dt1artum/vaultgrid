@@ -302,10 +302,22 @@ go run ./cmd/vaultgrid
 
 - `GET /v1/buckets/{bucketId}/objects/{key}` 返回原始字节，带 `ETag` 与 `X-Vaultgrid-Meta-*` 头；对象不存在返回 `404 object_not_found`。
 - `HEAD` 同上但无正文。
+- 读取（含版本桶的 `GET`/`HEAD`）支持单区间字节读取，规则见下文[区间读取](#区间读取)。
 - `GET /v1/buckets/{bucketId}/objects` 返回 `{"items":[...]}`，按 key 升序的对象摘要；只接受一个 `prefix` 查询参数，其他或重复参数返回 `400 invalid_request`。
 - `DELETE /v1/buckets/{bucketId}/objects/{key}` 返回 `204` 并释放容量；删除不存在（含从未存在）的对象仍为 `204`；桶不存在返回 `404 bucket_not_found`。
 
 非法 key、元数据、查询参数、未知字段或格式错误返回 `400 invalid_request`。并发写删不会超配、重扣或残留部分状态。
+
+#### 区间读取
+
+`GET`/`HEAD` 可携带 `Range` 请求头，仅接受单个 bytes 区间的三种形式：`bytes=start-end`、`bytes=start-`、`bytes=-suffixLength`（首尾均包含，相对所选版本的完整字节长度计算）。
+
+- 不带 `Range`：返回 `200` 及完整对象；成功的 200 与 206 均带 `Accept-Ranges: bytes`，且原有 `Content-Length`、`Content-Type`、`ETag`、`X-Vaultgrid-Meta-*` 及版本桶中的 `X-Vaultgrid-Version-Id` 语义不变。
+- 命中区间：返回 `206 Partial Content`，正文仅含选中的连续字节，`Content-Length` 为实际区间长度，`Content-Range: bytes 实际起点-实际终点/完整长度`。结束位置越界截到对象末尾；后缀长度达到或超过对象长度时返回整个对象（仍为 206）。
+- 不可满足：起始位置等于或超过对象长度、显式起点大于终点、以及对空对象的任何区间请求，返回 `416 range_not_satisfiable`，并带 `Content-Range: bytes */完整长度`。
+- 格式错误：单位不精确为 `bytes`、逗号分隔的多区间、两端皆空、负数或非十进制数、后缀长度为零、额外空白等任何其他形式，返回 `400 invalid_request`，不降级为完整读取。
+- 校验顺序：先校验桶、key、查询参数与 `versionId` 并选出目标版本，再处理 `Range`，故桶、对象或版本不存在时仍返回原有的 `404`。
+- `HEAD` 的区间响应与同一 `GET` 状态码和响应头一致但无正文；`400`/`416` 使用统一错误 JSON，HEAD 错误响应沿用既有处理。区间读取不改变对象、版本顺序、容量、租户用量或审计事件。
 
 #### 已启用版本控制的桶
 
