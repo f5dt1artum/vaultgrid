@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -695,11 +696,7 @@ func (s *store) getObject(w http.ResponseWriter, r *http.Request, bucketID, key 
 		default:
 			// No versionId: serve the currently visible version (the latest
 			// data version unless it is hidden by a delete marker).
-			var cur *objectVersion
-			if obj != nil {
-				cur = obj.visible()
-			}
-			if cur == nil {
+			if cur := obj.visible(); cur == nil {
 				notFoundCode = "object_not_found"
 			} else {
 				v = cur
@@ -707,6 +704,17 @@ func (s *store) getObject(w http.ResponseWriter, r *http.Request, bucketID, key 
 		}
 	}
 	versioned := bucketExists && b.versioningEnabled
+	// Snapshot the selected version before releasing the read lock so a
+	// concurrent overwrite, delete or new version cannot mix one version's
+	// bytes with another version's headers. Version content and metadata are
+	// immutable once stored; overwrites install a fresh version value.
+	var content []byte
+	var size int64
+	var etag, version string
+	var meta map[string]string
+	if v != nil {
+		content, size, etag, version, meta = v.content, v.sizeBytes, v.etag, v.versionID, v.metadata
+	}
 	s.mu.RUnlock()
 	if !bucketExists {
 		writeError(w, http.StatusNotFound, "bucket_not_found")
@@ -720,19 +728,100 @@ func (s *store) getObject(w http.ResponseWriter, r *http.Request, bucketID, key 
 		writeError(w, http.StatusNotFound, notFoundCode)
 		return
 	}
-	for name, value := range v.metadata {
+	s.writeObjectResponse(w, r, headOnly, versioned, version, etag, meta, content, size)
+}
+
+// writeObjectResponse answers a GET/HEAD read of one resolved object version,
+// applying an optional single byte range. Bucket, key, query and version
+// validation has already happened by the time this runs, so an unsatisfiable
+// or malformed Range can never mask a 404. Reads are side-effect free: they
+// touch no object state, counters or audit log.
+func (s *store) writeObjectResponse(w http.ResponseWriter, r *http.Request, headOnly, versioned bool,
+	version, etag string, meta map[string]string, content []byte, size int64) {
+	br, ok := parseRangeHeader(r.Header)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+
+	for name, value := range meta {
 		w.Header().Set(metaPrefix+name, value)
 	}
-	w.Header().Set("ETag", v.etag)
+	w.Header().Set("ETag", etag)
 	if versioned {
-		w.Header().Set(versionHeader, v.versionID)
+		w.Header().Set(versionHeader, version)
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", strconv.FormatInt(v.sizeBytes, 10))
-	w.WriteHeader(http.StatusOK)
-	if !headOnly {
-		_, _ = w.Write(v.content)
+
+	// No Range header answers 200 with the complete representation.
+	if br == nil {
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		w.WriteHeader(http.StatusOK)
+		if !headOnly {
+			_, _ = w.Write(content)
+		}
+		return
 	}
+
+	// Any range against an empty object is unsatisfiable, even a suffix.
+	if size == 0 {
+		writeRangeNotSatisfiable(w, size)
+		return
+	}
+
+	// A suffix that covers at least the whole object degrades to a complete
+	// 200 read; the object is shorter than the requested tail.
+	if br.suffix && br.suffixLen >= size {
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		w.WriteHeader(http.StatusOK)
+		if !headOnly {
+			_, _ = w.Write(content)
+		}
+		return
+	}
+
+	var start, end int64
+	switch {
+	case br.suffix:
+		start = size - br.suffixLen
+		end = size - 1
+	case br.end == -1:
+		// Open-ended "start-".
+		if br.start >= size {
+			writeRangeNotSatisfiable(w, size)
+			return
+		}
+		start = br.start
+		end = size - 1
+	default:
+		if br.start > br.end || br.start >= size {
+			writeRangeNotSatisfiable(w, size)
+			return
+		}
+		start = br.start
+		end = br.end
+		if end >= size {
+			// An end past the object is clipped to the last byte.
+			end = size - 1
+		}
+	}
+
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+	w.WriteHeader(http.StatusPartialContent)
+	if !headOnly {
+		_, _ = w.Write(content[start : end+1])
+	}
+}
+
+// writeRangeNotSatisfiable answers 416 with the mandated Content-Range marker
+// carrying the complete length of the selected version.
+func writeRangeNotSatisfiable(w http.ResponseWriter, size int64) {
+	w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(size, 10))
+	writeError(w, http.StatusRequestedRangeNotSatisfiable, "range_not_satisfiable")
 }
 
 func (s *store) deleteObject(w http.ResponseWriter, r *http.Request, bucketID, key string) {

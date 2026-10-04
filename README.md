@@ -302,10 +302,22 @@ go run ./cmd/vaultgrid
 
 - `GET /v1/buckets/{bucketId}/objects/{key}` 返回原始字节，带 `ETag` 与 `X-Vaultgrid-Meta-*` 头；对象不存在返回 `404 object_not_found`。
 - `HEAD` 同上但无正文。
+- `GET`/`HEAD` 支持单区间字节读取，见下。
 - `GET /v1/buckets/{bucketId}/objects` 返回 `{"items":[...]}`，按 key 升序的对象摘要；只接受一个 `prefix` 查询参数，其他或重复参数返回 `400 invalid_request`。
 - `DELETE /v1/buckets/{bucketId}/objects/{key}` 返回 `204` 并释放容量；删除不存在（含从未存在）的对象仍为 `204`；桶不存在返回 `404 bucket_not_found`。
 
 非法 key、元数据、查询参数、未知字段或格式错误返回 `400 invalid_request`。并发写删不会超配、重扣或残留部分状态。
+
+#### 单区间字节读取（Range）
+
+`GET`/`HEAD` 可携带 `Range` 请求头，只接受单字节区间的三种形式：`bytes=start-end`、`bytes=start-` 与 `bytes=-suffixLength`。区间按**选中版本**的完整字节长度计算，首尾均包含（闭区间，下标从 0 起）：
+
+- 不携带 `Range` 时返回 `200` 与完整对象；成功的 `200` 与 `206` 均带 `Accept-Ranges: bytes`。
+- 命中区间返回 `206 Partial Content`：`GET` 正文仅含选中的连续字节，`Content-Length` 为实际区间长度，并带 `Content-Range: bytes 实际起点-实际终点/完整长度`；`HEAD` 与同一 `GET` 的状态和响应头完全一致且无正文。
+- 结束位置越界时截到对象末尾；后缀长度达到或超过对象长度时返回 `200` 完整对象（对象比请求的尾部短）。
+- 起始位置等于或超过对象长度、`start` 大于 `end`，以及对空对象的任何区间请求，返回 `416 range_not_satisfiable`，并设置 `Content-Range: bytes */完整长度`。
+- `Range` 单位不精确为 `bytes`、逗号分隔的多区间、两端皆空（`bytes=`、`bytes=-`）、负数或非十进制数、后缀长度为零（`bytes=-0`）、额外空白或任何其他格式，均返回 `400 invalid_request`，不会降级为完整读取。
+- 桶、key、查询参数与 `versionId` 仍按既有规则先校验并选出目标版本，再处理 `Range`：桶、对象或版本不存在时仍返回原有 `404`。区间读取不改变对象、版本顺序、容量、租户用量或审计事件；并发覆盖、删除或新增版本时，单次响应的内容、长度、`ETag`、版本标识与区间头来自同一对象版本。
 
 #### 已启用版本控制的桶
 
@@ -313,6 +325,7 @@ go run ./cmd/vaultgrid
 
 - `GET`/`HEAD` 默认取当前可见版（最新数据版），并带 `X-Vaultgrid-Version-Id` 头；最新版本是删除标记或 key 不存在时返回 `404 object_not_found`。
 - 指定 `versionId` 时返回对应**数据版**及其版本头、`ETag`、元数据头；版本不存在或该版本是删除标记时返回 `404 object_version_not_found`。
+- 两种读取都支持 `Range` 单区间读取，区间按该选中版本的完整长度计算，成功的 `206` 同样带 `X-Vaultgrid-Version-Id`。
 - 只接受一个非空 `versionId` 参数；空值、重复或与其他参数（含 `prefix`）并用为 `400 invalid_request`。
 
 删除：
@@ -458,6 +471,7 @@ poolId,rawCapacityBytes,reservationBytes,volumeBytes,snapshotBytes,objectBytes,a
 | 409 | `quota_below_usage` | 租户配额限额低于该租户当前用量 |
 | 409 | `tenant_quota_exceeded` | 容量增加（建预留、建卷、卷扩容、建快照、克隆、写对象）超出该租户在池内的配额（缩容不受限） |
 | 412 | `precondition_failed` | 条件写入的 If-Match / If-None-Match 不满足 |
+| 416 | `range_not_satisfiable` | 对象读取的 `Range` 区间不可满足：起始等于/超过对象长度、起始大于结束，或对空对象请求任何区间；响应带 `Content-Range: bytes */完整长度` |
 
 ## 验证
 
