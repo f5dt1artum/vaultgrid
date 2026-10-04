@@ -28,7 +28,9 @@ type snapshotView struct {
 // generation. It deliberately does not reference the live source volume: once
 // taken it is independent, so later changes to or deletion of the source do
 // not affect it. Its size charges the source pool until the snapshot is
-// deleted. tenant is inherited from the source volume.
+// deleted. tenant is inherited from the source volume. sourceInstance pins the
+// exact volume incarnation the snapshot was taken from, so an in-place restore
+// can reject snapshots of a deleted-and-recreated volume sharing the same id.
 type snapshot struct {
 	id               string
 	sourceVolumeID   string
@@ -36,6 +38,7 @@ type snapshot struct {
 	sizeBytes        int64
 	sourceGeneration int64
 	tenant           string
+	sourceInstance   int64
 }
 
 func (s *snapshot) view() snapshotView {
@@ -176,6 +179,7 @@ func (s *store) createSnapshot(w http.ResponseWriter, r *http.Request, volumeID 
 		sizeBytes:        v.sizeBytes,
 		sourceGeneration: v.generation,
 		tenant:           v.tenant,
+		sourceInstance:   v.instance,
 	}
 	s.snapshots[in.ID] = snap
 	p.snapshotBytes += v.sizeBytes
@@ -249,6 +253,8 @@ func (s *store) createClone(w http.ResponseWriter, r *http.Request, snapshotID s
 		return
 	}
 	v := &volume{id: in.ID, poolID: in.PoolID, sizeBytes: snap.sizeBytes, createdSizeBytes: snap.sizeBytes, cloneSource: snapshotID, tenant: snap.tenant}
+	s.volumeSeq++
+	v.instance = s.volumeSeq
 	s.volumes[in.ID] = v
 	target.volumeBytes += snap.sizeBytes
 	target.tenantUsed[snap.tenant] += snap.sizeBytes

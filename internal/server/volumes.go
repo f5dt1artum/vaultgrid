@@ -24,6 +24,11 @@ type resizeVolumeInput struct {
 	ExpectedGeneration *int64 `json:"expectedGeneration"`
 }
 
+type restoreVolumeInput struct {
+	SnapshotID         string `json:"snapshotId"`
+	ExpectedGeneration *int64 `json:"expectedGeneration"`
+}
+
 // bindingView is the public representation of a volume binding.
 type bindingView struct {
 	NodeID string `json:"nodeId"`
@@ -101,6 +106,12 @@ func (s *store) routeVolumes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.createSnapshot(w, r, parts[0])
+	case len(parts) == 2 && parts[1] == "restore":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		s.restoreVolume(w, r, parts[0])
 	default:
 		writeError(w, http.StatusNotFound, "not_found")
 	}
@@ -178,6 +189,8 @@ func (s *store) createVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	v := &volume{id: in.ID, poolID: in.PoolID, sizeBytes: in.SizeBytes, createdSizeBytes: in.SizeBytes, tenant: tenant}
+	s.volumeSeq++
+	v.instance = s.volumeSeq
 	s.volumes[in.ID] = v
 	p.volumeBytes += in.SizeBytes
 	p.tenantUsed[tenant] += in.SizeBytes
@@ -314,6 +327,85 @@ func (s *store) putVolumeSize(w http.ResponseWriter, r *http.Request, volumeID s
 	}
 	// delta == 0 is an idempotent no-op: return the current representation
 	// without bumping the generation, touching accounting or appending an event.
+	writeJSON(w, http.StatusOK, v.view())
+}
+
+// restoreVolume handles POST /v1/volumes/{id}/restore. It rolls the target
+// volume back to a snapshot's size in place: no new volume is created and the
+// snapshot is kept. Only a snapshot taken from the volume's current instance
+// qualifies — a snapshot of a deleted predecessor with the same id is a
+// source mismatch, not history.
+//
+// The volume must be unbound (checked before the generation, matching
+// resize), and expectedGeneration must name the current generation. Unlike a
+// same-size resize, a restore always commits new state: the generation bumps
+// and a volume.restored event is appended even when the size does not change.
+// Growth is charged to the volume's tenant quota first and then to pool
+// capacity; shrinkage is subject to neither and frees both immediately.
+func (s *store) restoreVolume(w http.ResponseWriter, r *http.Request, volumeID string) {
+	// The sub-resource accepts no query string at all (ForceQuery catches a
+	// bare trailing "?" whose RawQuery is empty).
+	if r.URL.ForceQuery || r.URL.RawQuery != "" {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	var in restoreVolumeInput
+	if !decodeRequest(r, &in) {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if !validID(volumeID) || !validID(in.SnapshotID) || in.ExpectedGeneration == nil || *in.ExpectedGeneration < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	expected := *in.ExpectedGeneration
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.volumes[volumeID]
+	if !ok {
+		writeError(w, http.StatusNotFound, "volume_not_found")
+		return
+	}
+	snap, ok := s.snapshots[in.SnapshotID]
+	if !ok {
+		writeError(w, http.StatusNotFound, "snapshot_not_found")
+		return
+	}
+	if v.binding != "" {
+		writeError(w, http.StatusConflict, "volume_in_use")
+		return
+	}
+	if snap.sourceInstance != v.instance {
+		writeError(w, http.StatusConflict, "snapshot_source_mismatch")
+		return
+	}
+	if v.generation != expected {
+		writeError(w, http.StatusConflict, "stale_generation")
+		return
+	}
+	p := s.pools[v.poolID]
+	delta := snap.sizeBytes - v.sizeBytes
+	if delta > 0 {
+		// Growth is charged to the owning tenant's quota before pool capacity,
+		// matching resize; shrinkage is subject to neither.
+		if p.tenantQuotaExceeded(v.tenant, delta) {
+			writeError(w, http.StatusConflict, "tenant_quota_exceeded")
+			return
+		}
+		if p.allocated() > p.rawCapacity-delta {
+			writeError(w, http.StatusConflict, "insufficient_capacity")
+			return
+		}
+	}
+	// delta is positive for growth and negative for shrinkage, so a single
+	// signed adjustment covers the pool and the tenant's usage. The snapshot
+	// itself keeps charging the pool unchanged.
+	p.volumeBytes += delta
+	p.tenantUsed[v.tenant] += delta
+	v.sizeBytes = snap.sizeBytes
+	v.generation++
+	s.appendAudit(auditVolumeRestored, volumePath+"/"+volumeID+"/restore", v.poolID, delta)
 	writeJSON(w, http.StatusOK, v.view())
 }
 

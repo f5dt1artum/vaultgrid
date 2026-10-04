@@ -76,7 +76,10 @@ type pool struct {
 // snapshot size for clones); idempotent create replays match it rather than
 // the live sizeBytes, so resizing a volume never turns a faithful retry into a
 // volume_exists conflict. tenant is the owning tenant; its current sizeBytes is
-// charged to the tenant's usage in the pool.
+// charged to the tenant's usage in the pool. instance identifies this specific
+// incarnation of the volume id: it is drawn from the store-wide volumeSeq
+// counter at creation, so deleting a volume and re-creating the same id yields
+// a new instance and snapshots taken from the old one no longer match it.
 type volume struct {
 	id               string
 	poolID           string
@@ -86,6 +89,7 @@ type volume struct {
 	binding          string // "" when unbound
 	cloneSource      string // snapshot id when produced via a clone
 	tenant           string
+	instance         int64
 }
 
 func (p *pool) allocated() int64 {
@@ -124,6 +128,10 @@ type store struct {
 	// the business state each event describes.
 	auditEvents []auditEvent
 	auditSeq    int64
+	// volumeSeq numbers volume instances; every volume creation (direct or
+	// clone) takes the next value, so a re-created id never shares an
+	// instance with its deleted predecessor.
+	volumeSeq int64
 }
 
 func newStore() *store {
